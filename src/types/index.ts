@@ -23,6 +23,8 @@ export enum LogLevel {
   TRACE = 4
 }
 
+
+
 /**
  * Log kaydı yapısı
  * Her log girişi bu formatta saklanır
