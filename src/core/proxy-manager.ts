@@ -1,14 +1,10 @@
-// src/core/proxy-manager.ts
+// src/core/proxy-manager.ts (DÜZELTİLMİŞ)
 
 import * as fs from 'fs';
-import * as path from 'path';
-import { createHash } from 'crypto';
 import {
-  ProxyConfig,
   ProxyItem,
-  Logger,
-  LogLevel,
 } from '../types';
+import { Logger } from '../utils/logger';
 
 /**
  * Proxy durum bilgisi
