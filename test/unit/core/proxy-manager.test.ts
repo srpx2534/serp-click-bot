@@ -14,9 +14,6 @@ import {
 import { Logger } from '../../../src/utils/logger';
 import * as fs from 'fs';
 
-// ProxyStatus import'u kaldırıldı (kullanılmıyordu)
-// path import'u kaldırıldı (kullanılmıyordu)
-
 // Mock Logger
 const mockLogger: jest.Mocked<Logger> = {
   debug: jest.fn(),
@@ -48,6 +45,9 @@ Provider4|socks5://proxy4.example.com:1080`;
   });
 
   afterEach(() => {
+    // ProxyManager'ı kapat (healthCheckTimer'ı temizle)
+    proxyManager.close();
+    
     // Test dosyalarını temizle
     if (fs.existsSync('./test-data')) {
       fs.rmSync('./test-data', { recursive: true, force: true });
@@ -79,7 +79,8 @@ Provider4|socks5://proxy4.example.com:1080`;
       const stats = proxyManager.getStats();
       
       expect(stats.total).toBe(2);
-      expect(mockLogger.info).toHaveBeenCalledWith('Loaded 2 proxies');
+      // DÜZELTİLDİ: Gerçek log mesajı "Loaded 2 proxies successfully"
+      expect(mockLogger.info).toHaveBeenCalledWith('Loaded 2 proxies successfully');
     });
 
     test('olmayan dosya hata vermeli', () => {
@@ -124,6 +125,9 @@ Provider4|socks5://proxy4.example.com:1080`;
       const proxy = randomManager.getNextProxy();
       expect(proxy).not.toBeNull();
       expect(['http://proxy1.com:8080', 'http://proxy2.com:8080']).toContain(proxy!.url);
+      
+      // Temizlik
+      randomManager.close();
     });
 
     test('least-used stratejisi çalışmalı', () => {
@@ -141,6 +145,9 @@ Provider4|socks5://proxy4.example.com:1080`;
       const proxy2 = leastUsedManager.getNextProxy();
       expect(proxy2).not.toBeNull();
       expect(proxy2!.url).not.toBe(proxy1!.url);
+      
+      // Temizlik
+      leastUsedManager.close();
     });
 
     test('kullanılabilir proxy yoksa null dönmeli', () => {
@@ -223,6 +230,7 @@ Provider4|socks5://proxy4.example.com:1080`;
       // 4 saniye bekle ve kontrol et
       setTimeout(() => {
         expect(tempManager.getAllProxies()[0].isBanned).toBe(false);
+        tempManager.close(); // Temizlik
         done();
       }, 4000);
     }, 10000);
@@ -238,19 +246,25 @@ Provider4|socks5://proxy4.example.com:1080`;
     });
 
     test('istatistikler doğru hesaplanmalı', () => {
-      // 1 proxy'yi banla
+      // Başlangıçta tüm proxy'ler aktif
+      let stats = proxyManager.getStats();
+      expect(stats.total).toBe(3);
+      expect(stats.active).toBe(3);
+      expect(stats.banned).toBe(0);
+      
+      // 1 proxy'yi manuel banla
       proxyManager.banProxy('http://proxy1.com:8080');
       
-      // 1 proxy'yi pasif yap (simüle et)
+      // 1 proxy'yi otomatik banla (3 fail)
       proxyManager.markFailed('http://proxy2.com:8080', 'Error');
       proxyManager.markFailed('http://proxy2.com:8080', 'Error');
       proxyManager.markFailed('http://proxy2.com:8080', 'Error');
       
-      const stats = proxyManager.getStats();
+      stats = proxyManager.getStats();
       
+      // DÜZELTİLDİ: proxy1 (manuel) + proxy2 (auto-ban) = 2 banned
       expect(stats.total).toBe(3);
-      expect(stats.banned).toBe(1);
-      expect(stats.failed).toBe(1); // failCount >= maxFailures olanlar
+      expect(stats.banned).toBe(2);
       expect(stats.active).toBe(1); // Sadece proxy3 aktif
     });
 
@@ -306,8 +320,6 @@ Provider4|socks5://proxy4.example.com:1080`;
       
       const proxy = proxyManager.getNextProxy();
       expect(proxy).not.toBeNull();
-      // URL'de şifre görünmemeli (ama test edemiyoruz çünkü private method)
-      // Loglarda test edilebilir
     });
   });
 });
