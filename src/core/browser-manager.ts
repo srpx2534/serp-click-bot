@@ -369,10 +369,10 @@ export class BrowserManager {
         if (!(window as any).chrome) indicators.push('no_chrome');
         
         // Plugins check
-        if (navigator.plugins.length === 0) indicators.push('no_plugins');
+        if ((navigator as any).plugins.length === 0) indicators.push('no_plugins');
         
         // User agent check
-        if (navigator.userAgent.includes('HeadlessChrome')) indicators.push('headless_ua');
+        if ((navigator as any).userAgent.includes('HeadlessChrome')) indicators.push('headless_ua');
         
         return indicators;
       });
@@ -390,7 +390,7 @@ export class BrowserManager {
   private async applyEmergencyStealth(page: Page): Promise<void> {
     await page.evaluate(() => {
       // Additional evasion techniques
-      Object.defineProperty(navigator, 'plugins', {
+      Object.defineProperty(navigator as any, 'plugins', {
         get: () => [
           { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
           { name: 'Widevine Content Decryption Module', filename: 'widevinecdmadapter.dll' },
@@ -398,7 +398,7 @@ export class BrowserManager {
       });
 
       // Override permissions
-      Object.defineProperty(Notification, 'permission', {
+      Object.defineProperty(Notification as any, 'permission', {
         get: () => 'default',
       });
     });
