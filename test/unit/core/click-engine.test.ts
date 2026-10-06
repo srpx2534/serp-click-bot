@@ -1,3 +1,9 @@
+/**
+ * ClickEngine Unit Tests
+ *
+ * Jest 29 + ts-jest
+ */
+
 import {
   ClickEngine,
   createClickEngine,
@@ -342,13 +348,6 @@ describe('ClickEngine', () => {
         }),
       ).resolves.not.toThrow();
 
-      /*
-       * Zero-distance movement does not necessarily require
-       * a physical mouse.move call.
-       *
-       * The important contract here is that the operation
-       * completes successfully without NaN/Infinity.
-       */
       for (const call of page.mouse.move.mock.calls) {
         expect(Number.isFinite(call[0])).toBe(true);
         expect(Number.isFinite(call[1])).toBe(true);
@@ -400,33 +399,33 @@ describe('ClickEngine', () => {
         {
           click: {
             hoverDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
             postClickDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
             moveDuration: {
-              min: 0,
-              max: 0,
-              mean: 1,
+              min: 100,
+              max: 200,
+              mean: 150,
               sigma: 0.1,
             },
 
-            holdDuration: {
-              min: 100,
-              max: 100,
+            clickHoldDuration: {
+              min: 80,
+              max: 120,
               mean: 100,
-              sigma: 0,
+              sigma: 0.1,
             },
-          } as any,
+          },
         },
         logger,
       );
@@ -599,26 +598,26 @@ describe('ClickEngine', () => {
         {
           click: {
             hoverDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
             postClickDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
-            holdDuration: {
+            clickHoldDuration: {
               min: 100,
               max: 100,
               mean: 100,
-              sigma: 0,
+              sigma: 0.1,
             },
-          } as any,
+          },
         },
         logger,
       );
@@ -626,8 +625,8 @@ describe('ClickEngine', () => {
       await engine.mouse.click(locator);
 
       expect(holdDuration).toBe(100);
-      expect(events).toContain('down');
-      expect(events).toContain('up');
+      expect(events[0]).toBe('down');
+      expect(events[events.length - 1]).toBe('up');
     });
   });
 
@@ -914,13 +913,69 @@ describe('ClickEngine', () => {
     });
 
     it('should support scrolling while reading', async () => {
+      // Mock'ları sıfırla
+      jest.clearAllMocks();
+      page = createPageMock();
+
+      // Çok uzun içerik mock'u - scroll loop'u tetiklemek için
+      const longContent = 'word '.repeat(50000); // 50K kelime
+      let scrollY = 0;
+      const scrollHeight = 50000; // Çok uzun sayfa
+      const viewportHeight = 800;
+
+      page.evaluate.mockImplementation(async (fn: Function, ...args: any[]) => {
+        const fnString = fn.toString();
+
+        // window.scrollY
+        if (fnString.includes('window.scrollY') || fnString.includes('scrollY')) {
+          return scrollY;
+        }
+
+        // document.body.scrollHeight
+        if (fnString.includes('scrollHeight') || fnString.includes('scrollHeight')) {
+          return scrollHeight;
+        }
+
+        // window.innerHeight
+        if (fnString.includes('innerHeight') || fnString.includes('innerHeight')) {
+          return viewportHeight;
+        }
+
+        // document.body.innerText
+        if (fnString.includes('innerText') || fnString.includes('textContent')) {
+          return longContent;
+        }
+
+        // document.images veya querySelectorAll('img')
+        if (fnString.includes('images') || fnString.includes('querySelectorAll')) {
+          return 10; // 10 resim
+        }
+
+        // window.scrollBy - scrollY'yi güncelle
+        if (fnString.includes('scrollBy')) {
+          const amount = args[0] || 500;
+          scrollY += amount;
+          return undefined;
+        }
+
+        // window.scrollTo
+        if (fnString.includes('scrollTo')) {
+          scrollY = args[0]?.top || args[0] || 0;
+          return undefined;
+        }
+
+        return undefined;
+      });
+
       const engine = new ClickEngine(
         page,
         {
           reading: {
-            minDuration: 10000,
-            maxDuration: 30000,
-            scrollRatio: 1,
+            minDuration: 5000,     // 5 saniye minimum
+            maxDuration: 10000,    // 10 saniye maksimum
+            scrollRatio: 1,        // Tam scroll
+            msPerWord: { min: 100, max: 150 }, // Hızlı okuma
+            msPerImage: { min: 500, max: 800 },
           },
         },
         logger,
@@ -930,17 +985,24 @@ describe('ClickEngine', () => {
         scroll: true,
       });
 
-      /*
-       * Long deterministic content guarantees that
-       * the reading duration is large enough to enter
-       * the scrolling loop.
-       */
-      expect(page.waitForTimeout).toHaveBeenCalled();
+      // Assertions
       expect(page.evaluate).toHaveBeenCalled();
-
-      expect(
-        page.waitForTimeout.mock.calls.length,
-      ).toBeGreaterThan(0);
+      
+      // waitForTimeout mutlaka çağrılmalı
+      expect(page.waitForTimeout.mock.calls.length).toBeGreaterThan(0);
+      
+      // scrollBy veya scrollTo çağrılmalı
+      const scrollCalls = page.evaluate.mock.calls.filter(
+        (call: any[]) => {
+          const fn = call[0];
+          return typeof fn === 'function' && 
+            (fn.toString().includes('scrollBy') || 
+             fn.toString().includes('scrollTo'));
+        }
+      );
+      
+      // En azından bir scroll çağrısı olmalı
+      expect(scrollCalls.length).toBeGreaterThan(0);
     });
 
     it('should work with empty content', async () => {
@@ -1603,26 +1665,26 @@ describe('ClickEngine', () => {
         {
           click: {
             hoverDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
             postClickDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
-            holdDuration: {
+            clickHoldDuration: {
               min: 75,
               max: 75,
               mean: 75,
-              sigma: 0,
+              sigma: 0.1,
             },
-          } as any,
+          },
         },
         logger,
       );
@@ -1659,26 +1721,26 @@ describe('ClickEngine', () => {
         {
           click: {
             hoverDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
             postClickDelay: {
-              min: 0,
-              max: 0,
-              mean: 0,
+              min: 50,
+              max: 100,
+              mean: 75,
               sigma: 0.1,
             },
 
-            holdDuration: {
+            clickHoldDuration: {
               min: 50,
               max: 150,
               mean: 100,
-              sigma: 0.3,
+              sigma: 0.1,
             },
-          } as any,
+          },
         },
         logger,
       );
