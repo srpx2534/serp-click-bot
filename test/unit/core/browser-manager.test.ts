@@ -9,13 +9,9 @@
  * - Stealth scripts doğrulanır
  */
 
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import {
   BrowserManager,
   BrowserManagerConfig,
-  getBrowserManager,
   resetBrowserManager,
   createBrowserManager,
   getNamedBrowserManager,
@@ -295,7 +291,7 @@ describe('BrowserManager (Patchright)', () => {
     });
 
     test('Mobile fingerprint için isMobile true olmalı', async () => {
-      const mobileFingerprint = { ...mockFingerprint, type: 'mobile', isMobile: true, touchSupport: true };
+      const mobileFingerprint = { ...mockFingerprint, type: 'mobile' as const, isMobile: true, touchSupport: true };
       
       await browserManager.launchBrowser(mobileFingerprint, mockProxy);
       
@@ -372,7 +368,7 @@ describe('BrowserManager (Patchright)', () => {
     });
 
     test('Mobile için device metrics override yapılmalı', async () => {
-      const mobileFingerprint = { ...mockFingerprint, type: 'mobile', isMobile: true };
+      const mobileFingerprint = { ...mockFingerprint, type: 'mobile' as const, isMobile: true };
       
       await browserManager.launchBrowser(mobileFingerprint, mockProxy);
       
