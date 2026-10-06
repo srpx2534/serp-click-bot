@@ -11,6 +11,22 @@ import { FingerprintData } from '../types';
 import { ProxyStatus } from './proxy-manager';
 import { Logger, getLogger } from '../utils/logger';
 
+// Browser API'leri için global declarations
+// Bu modül Playwright ile browser ortamında çalıştığı için gerekli
+declare global {
+  const navigator: {
+    webdriver?: boolean;
+    plugins: { length: number };
+    userAgent: string;
+  };
+  const window: {
+    chrome?: any;
+  };
+  const Notification: {
+    permission: string;
+  };
+}
+
 // Browser instance bilgisi
 interface BrowserInstance {
   context: BrowserContext;
@@ -363,16 +379,16 @@ export class BrowserManager {
         const indicators: string[] = [];
         
         // Webdriver check
-        if ((navigator as any).webdriver) indicators.push('webdriver');
+        if (navigator.webdriver) indicators.push('webdriver');
         
         // Chrome check
-        if (!(window as any).chrome) indicators.push('no_chrome');
+        if (!window.chrome) indicators.push('no_chrome');
         
         // Plugins check
-        if ((navigator as any).plugins.length === 0) indicators.push('no_plugins');
+        if (navigator.plugins.length === 0) indicators.push('no_plugins');
         
         // User agent check
-        if ((navigator as any).userAgent.includes('HeadlessChrome')) indicators.push('headless_ua');
+        if (navigator.userAgent.includes('HeadlessChrome')) indicators.push('headless_ua');
         
         return indicators;
       });
@@ -384,13 +400,14 @@ export class BrowserManager {
     }
   }
 
+
   /**
    * Acil stealth uygulama (bot detection sonrası)
    */
   private async applyEmergencyStealth(page: Page): Promise<void> {
     await page.evaluate(() => {
       // Additional evasion techniques
-      Object.defineProperty(navigator as any, 'plugins', {
+      Object.defineProperty(navigator, 'plugins', {
         get: () => [
           { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
           { name: 'Widevine Content Decryption Module', filename: 'widevinecdmadapter.dll' },
@@ -398,7 +415,7 @@ export class BrowserManager {
       });
 
       // Override permissions
-      Object.defineProperty(Notification as any, 'permission', {
+      Object.defineProperty(Notification, 'permission', {
         get: () => 'default',
       });
     });
