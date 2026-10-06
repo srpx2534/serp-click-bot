@@ -7,17 +7,14 @@
 import { chromium, Browser, BrowserContext, Page, LaunchOptions } from 'playwright';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import {
-  BrowserConfig,
-  BrowserFingerprint,
-  ProxyStatus,
-} from '../types';
+import { FingerprintData } from '../types';
+import { ProxyStatus } from './proxy-manager';
 import { Logger, getLogger } from '../utils/logger';
 
 // Browser instance bilgisi
 interface BrowserInstance {
   context: BrowserContext;
-  fingerprint: BrowserFingerprint;
+  fingerprint: FingerprintData;
   proxy: ProxyStatus;
   createdAt: Date;
   lastUsed: Date;
@@ -78,7 +75,7 @@ export class BrowserManager {
    * Fingerprint ve proxy entegrasyonu yapar
    */
   public async launchBrowser(
-    fingerprint: BrowserFingerprint,
+    fingerprint: FingerprintData,
     proxy: ProxyStatus,
     cookies?: any[]
   ): Promise<BrowserContext> {
@@ -196,7 +193,7 @@ export class BrowserManager {
    */
   private async applyStealthScripts(
     context: BrowserContext,
-    fingerprint: BrowserFingerprint
+    fingerprint: FingerprintData
   ): Promise<void> {
     
     // Navigator property override
@@ -363,13 +360,13 @@ export class BrowserManager {
   private async checkBotDetection(page: Page): Promise<boolean> {
     try {
       const botIndicators = await page.evaluate(() => {
-        const indicators = [];
+        const indicators: string[] = [];
         
         // Webdriver check
-        if (navigator.webdriver) indicators.push('webdriver');
+        if ((navigator as any).webdriver) indicators.push('webdriver');
         
         // Chrome check
-        if (!window.chrome) indicators.push('no_chrome');
+        if (!(window as any).chrome) indicators.push('no_chrome');
         
         // Plugins check
         if (navigator.plugins.length === 0) indicators.push('no_plugins');
