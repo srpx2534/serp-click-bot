@@ -1,1045 +1,1984 @@
 /**
- * BrowserManager Modülü - Patchright Tabanlı
- * 
- * Özellikler:
- * - Patchright (Playwright'ın stealth versiyonu)
- * - Resource Interceptor (gereksiz kaynakları engelleme)
- * - Lifecycle Manager (crash recovery, timeout handling)
- * - WebRTC Leak Protection
- * - Runtime Fingerprint Randomizer
- * - CDP (Chrome DevTools Protocol) entegrasyonu
+ * BrowserManager.ts
+ *
+ * Patchright tabanlı, tek dosyalık browser lifecycle manager.
+ *
+ * Odak:
+ * - Browser / Context lifecycle
+ * - Concurrency control
+ * - Proxy
+ * - Cookie persistence
+ * - Resource interception
+ * - Page lifecycle
+ * - Crash detection
+ * - Timeout yönetimi
+ * - Graceful shutdown
+ *
+ * Bilinçli olarak:
+ * - navigator spoofing
+ * - WebGL spoofing
+ * - Canvas noise
+ * - sahte PluginArray
+ * - sahte window.chrome
+ * - sahte CDP stealth komutları
+ *
+ * kullanılmıyor.
+ *
+ * Patchright kendi automation düzeltmelerini sağladığı için
+ * browser fingerprint'ini gereksiz şekilde bozmak yerine
+ * gerçek browser/context ayarlarının tutarlı tutulması tercih edilir.
  */
 
-import { chromium, Browser, BrowserContext, Page, CDPSession, Route, Request } from 'patchright';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Page,
+  type Route,
+  type Request,
+} from 'patchright';
+
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'fs';
+
 import { join } from 'path';
-import { FingerprintData } from '../types';
-import { ProxyStatus } from './proxy-manager';
-import { Logger, getLogger } from '../utils/logger';
 
-// Browser instance bilgisi
-interface BrowserInstance {
-  context: BrowserContext;
-  browser: Browser;
-  fingerprint: FingerprintData;
-  proxy: ProxyStatus;
-  createdAt: Date;
-  lastUsed: Date;
-  pageCount: number;
-  cdpSession?: CDPSession;
-}
+import type { FingerprintData } from '../types';
+import type { ProxyStatus } from './proxy-manager';
 
-// Resource interception config
-interface ResourceInterceptorConfig {
+import {
+  Logger,
+  getLogger,
+} from '../utils/logger';
+
+/* =========================================================
+ * TYPES
+ * ======================================================= */
+
+type Cookie =
+  Parameters<BrowserContext['addCookies']>[0][number];
+
+export interface ResourceInterceptorConfig {
   blockImages: boolean;
   blockFonts: boolean;
   blockMedia: boolean;
   blockCSS: boolean;
-  blockWebRTC: boolean;
-  allowedDomains?: string[];
+  blockTracking: boolean;
+
+  allowedDomains: string[];
+
+  trackingHosts: string[];
 }
 
-// Lifecycle config
-interface LifecycleConfig {
+export interface LifecycleConfig {
   navigationTimeout: number;
-  pageLoadTimeout: number;
+  defaultTimeout: number;
+
   crashRecovery: boolean;
   maxRecoveryAttempts: number;
+
   popupHandling: boolean;
   dialogHandling: boolean;
+
+  /**
+   * Browser idle kalırsa otomatik kapat.
+   * 0 => disabled
+   */
+  idleTimeoutMs: number;
+
+  /**
+   * Browser maksimum yaşam süresi.
+   * 0 => disabled
+   */
+  maxLifetimeMs: number;
 }
 
-// BrowserManager yapılandırması
 export interface BrowserManagerConfig {
   maxConcurrentBrowsers: number;
-  defaultTimeout: number;
+
   headless: boolean;
+
+  channel?: 'chrome' | undefined;
+
   debugMode: boolean;
+
   cookieDir: string;
+
   userDataDir: string;
+
   resourceInterceptor: Partial<ResourceInterceptorConfig>;
+
   lifecycle: Partial<LifecycleConfig>;
+
+  launchArgs: string[];
+
+  colorScheme: 'light' | 'dark' | 'no-preference';
 }
 
-// Varsayılan yapılandırma
-const defaultConfig: BrowserManagerConfig = {
+interface PageHandlers {
+  crash: () => void;
+  close: () => void;
+  dialog?: (dialog: any) => void;
+  popup?: (popup: Page) => void;
+  pageerror?: (error: Error) => void;
+  requestfailed?: (request: Request) => void;
+}
+
+interface BrowserInstance {
+  id: string;
+
+  browser: Browser;
+  context: BrowserContext;
+
+  fingerprint: FingerprintData;
+  proxy: ProxyStatus;
+
+  createdAt: Date;
+  lastUsed: Date;
+
+  totalPagesCreated: number;
+  activePages: number;
+
+  recoveryAttempts: number;
+
+  closing: boolean;
+
+  pageHandlers: Map<Page, PageHandlers>;
+}
+
+/* =========================================================
+ * DEFAULT CONFIG
+ * ======================================================= */
+
+const DEFAULT_CONFIG: BrowserManagerConfig = {
   maxConcurrentBrowsers: 5,
-  defaultTimeout: 30000,
+
   headless: true,
+
+  channel: undefined,
+
   debugMode: false,
+
   cookieDir: './data/cookies',
+
   userDataDir: './data/browser-data',
+
   resourceInterceptor: {
     blockImages: true,
     blockFonts: true,
     blockMedia: true,
-    blockCSS: false, // CSS gerekli olabilir
-    blockWebRTC: true,
+    blockCSS: false,
+
+    blockTracking: false,
+
+    allowedDomains: [],
+
+    trackingHosts: [
+      'google-analytics.com',
+      'googletagmanager.com',
+      'connect.facebook.net',
+      'facebook.com',
+      'doubleclick.net',
+    ],
   },
+
   lifecycle: {
-    navigationTimeout: 30000,
-    pageLoadTimeout: 60000,
+    navigationTimeout: 30_000,
+    defaultTimeout: 30_000,
+
     crashRecovery: true,
     maxRecoveryAttempts: 3,
+
     popupHandling: true,
     dialogHandling: true,
+
+    idleTimeoutMs: 0,
+    maxLifetimeMs: 0,
   },
+
+  launchArgs: [
+    '--disable-dev-shm-usage',
+  ],
+
+  colorScheme: 'light',
 };
 
-/**
- * BrowserManager sınıfı - Patchright tabanlı
- */
+/* =========================================================
+ * BROWSER MANAGER
+ * ======================================================= */
+
 export class BrowserManager {
-  private config: BrowserManagerConfig;
-  private logger: Logger;
-  private activeBrowsers: Map<string, BrowserInstance> = new Map();
-  private cookieCache: Map<string, any[]> = new Map();
-  private recoveryAttempts: Map<string, number> = new Map();
+  private readonly config: BrowserManagerConfig;
 
-  constructor(config: Partial<BrowserManagerConfig> = {}, logger?: Logger) {
-    this.config = { ...defaultConfig, ...config };
-    this.logger = logger || getLogger();
+  private readonly logger: Logger;
+
+  private readonly activeBrowsers =
+    new Map<string, BrowserInstance>();
+
+  private readonly cookieCache =
+    new Map<string, Cookie[]>();
+
+  private shuttingDown = false;
+
+  /**
+   * Number of browser instances currently occupying
+   * the concurrency limit.
+   *
+   * Bu değer launch sırasında değil,
+   * browser instance aktif olduğu sürece tutulur.
+   */
+  private activeSlots = 0;
+
+  /**
+   * Waiting browser launches.
+   */
+  private readonly waitingLaunches: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }> = [];
+
+  private cleanupTimer?: ReturnType<typeof setInterval>;
+
+  constructor(
+    config: Partial<BrowserManagerConfig> = {},
+    logger?: Logger,
+  ) {
+    this.config = this.mergeConfig(config);
+
+    this.logger = logger ?? getLogger();
+
     this.ensureDirectories();
+
+    this.startCleanupTimer();
   }
 
-  /**
-   * Gerekli dizinleri oluşturur
-   */
+  /* =======================================================
+   * CONFIG
+   * ===================================================== */
+
+  private mergeConfig(
+    config: Partial<BrowserManagerConfig>,
+  ): BrowserManagerConfig {
+    const maxConcurrentBrowsers =
+      config.maxConcurrentBrowsers ??
+      DEFAULT_CONFIG.maxConcurrentBrowsers;
+
+    if (
+      !Number.isInteger(maxConcurrentBrowsers) ||
+      maxConcurrentBrowsers < 1
+    ) {
+      throw new Error(
+        'maxConcurrentBrowsers must be an integer greater than 0.',
+      );
+    }
+
+    return {
+      ...DEFAULT_CONFIG,
+      ...config,
+
+      maxConcurrentBrowsers,
+
+      resourceInterceptor: {
+        ...DEFAULT_CONFIG.resourceInterceptor,
+        ...(config.resourceInterceptor ?? {}),
+      },
+
+      lifecycle: {
+        ...DEFAULT_CONFIG.lifecycle,
+        ...(config.lifecycle ?? {}),
+      },
+
+      launchArgs:
+        config.launchArgs ??
+        [...DEFAULT_CONFIG.launchArgs],
+    };
+  }
+
+  /* =======================================================
+   * DIRECTORIES
+   * ===================================================== */
+
   private ensureDirectories(): void {
-    const dirs = [this.config.cookieDir, this.config.userDataDir];
-    dirs.forEach(dir => {
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
+    for (const directory of [
+      this.config.cookieDir,
+      this.config.userDataDir,
+    ]) {
+      if (!existsSync(directory)) {
+        mkdirSync(directory, {
+          recursive: true,
+        });
       }
-    });
+    }
   }
 
-  /**
-   * Yeni browser context oluşturur
-   */
+  /* =======================================================
+   * LAUNCH
+   * ======================================================= */
+
   public async launchBrowser(
     fingerprint: FingerprintData,
     proxy: ProxyStatus,
-    cookies?: any[]
+    cookies?: Cookie[],
   ): Promise<BrowserContext> {
-    if (this.activeBrowsers.size >= this.config.maxConcurrentBrowsers) {
-      this.logger.warn('Max concurrent browsers reached, waiting...');
-      await this.waitForAvailableSlot();
+    if (this.shuttingDown) {
+      throw new Error(
+        'BrowserManager is shutting down.',
+      );
     }
 
-    const contextId = this.generateContextId();
-    
+    /*
+     * Concurrency slot browser kapanana kadar tutulur.
+     *
+     * Önceki implementasyonda slot launch tamamlandıktan
+     * hemen sonra release ediliyordu. Bu nedenle:
+     *
+     * maxConcurrentBrowsers = 1
+     *
+     * olsa bile ikinci browser açılabiliyordu.
+     */
+    await this.acquireSlot();
+
+    const contextId =
+      this.generateContextId();
+
+    let browser: Browser | undefined;
+    let context: BrowserContext | undefined;
+
+    let registered = false;
+
     try {
-      this.logger.info(`Launching browser with fingerprint ${fingerprint.id}`, {
-        contextId,
-        proxy: this.maskProxyUrl(proxy.url),
-        type: fingerprint.type,
-      });
-
-      // Proxy URL parse
-      const proxyUrl = new URL(proxy.url);
-      
-      // Browser launch options - Patchright stealth args
-      const launchOptions = {
-        headless: this.config.headless,
-        proxy: {
-          server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
-          username: proxyUrl.username || undefined,
-          password: proxyUrl.password || undefined,
-        },
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-site-isolation-trials',
-          '--disable-web-security',
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--disable-gpu',
-          '--window-size=' + `${fingerprint.viewport.width},${fingerprint.viewport.height}`,
-          // Patchright stealth args
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-site-isolation-trials',
-          '--disable-features=BlockInsecurePrivateNetworkRequests',
-          '--disable-features=InterestCohort',
-          '--disable-features=SharedArrayBuffer',
-          '--disable-features=WebOTP',
-          '--disable-features=ConversionMeasurement',
-          '--disable-features=AttributionReportingCrossAppWeb',
-        ],
-      };
-
-      // Browser oluştur (Patchright)
-      const browser = await chromium.launch(launchOptions);
-      
-      // Context oluştur
-      const context = await browser.newContext({
-        viewport: {
-          width: fingerprint.viewport.width,
-          height: fingerprint.viewport.height,
-        },
-        userAgent: fingerprint.userAgent,
-        locale: fingerprint.language,
-        timezoneId: fingerprint.timezone,
-        deviceScaleFactor: fingerprint.pixelRatio,
-        isMobile: fingerprint.type === 'mobile',
-        hasTouch: fingerprint.touchSupport,
-        colorScheme: 'light',
-        extraHTTPHeaders: {
-          'Accept-Language': fingerprint.languages.join(','),
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'DNT': '1',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1',
-          'Sec-CH-UA': this.generateSecCHUA(fingerprint),
-          'Sec-CH-UA-Mobile': fingerprint.type === 'mobile' ? '?1' : '?0',
-          'Sec-CH-UA-Platform': `"${fingerprint.platform}"`,
-        },
-      });
-
-      // CDP Session oluştur (derin stealth için)
-      const page = await context.newPage();
-      const cdpSession = await page.context().newCDPSession(page);
-      
-      // CDP üzerinden stealth uygula
-      await this.applyCDPStealth(cdpSession, fingerprint);
-      
-      // Resource interceptor kur
-      await this.setupResourceInterceptor(context, this.config.resourceInterceptor);
-      
-      // Lifecycle manager kur
-      await this.setupLifecycleManager(context, this.config.lifecycle);
-
-      // Stealth scripts uygula
-      await this.applyStealthScripts(context, fingerprint);
-
-      // Cookie yükle
-      if (cookies && cookies.length > 0) {
-        await context.addCookies(cookies);
-      } else if (this.cookieCache.has(fingerprint.id)) {
-        await context.addCookies(this.cookieCache.get(fingerprint.id)!);
+      if (this.shuttingDown) {
+        throw new Error(
+          'BrowserManager is shutting down.',
+        );
       }
 
-      // Page'i kapat (sadece CDP için açmıştık)
-      await page.close();
+      this.logger.info(
+        'Launching browser',
+        {
+          contextId,
+          fingerprint: fingerprint.id,
+          fingerprintType: fingerprint.type,
+          proxy: this.maskProxyUrl(proxy.url),
+        },
+      );
 
-      // Browser instance kaydet
-      const instance: BrowserInstance = {
+      const proxyConfig =
+        this.parseProxy(proxy.url);
+
+      browser = await chromium.launch({
+        headless: this.config.headless,
+
+        ...(this.config.channel
+          ? {
+              channel: this.config.channel,
+            }
+          : {}),
+
+        proxy: proxyConfig,
+
+        args: [
+          ...this.config.launchArgs,
+        ],
+      });
+
+      if (this.shuttingDown) {
+        throw new Error(
+          'BrowserManager is shutting down.',
+        );
+      }
+
+      context =
+        await browser.newContext({
+          viewport: {
+            width:
+              fingerprint.viewport.width,
+            height:
+              fingerprint.viewport.height,
+          },
+
+          userAgent:
+            fingerprint.userAgent,
+
+          locale:
+            fingerprint.language,
+
+          timezoneId:
+            fingerprint.timezone,
+
+          deviceScaleFactor:
+            fingerprint.pixelRatio,
+
+          isMobile:
+            fingerprint.type === 'mobile',
+
+          hasTouch:
+            fingerprint.touchSupport,
+
+          colorScheme:
+            this.config.colorScheme,
+        });
+
+      /*
+       * Resource routing.
+       */
+      await this.setupResourceInterceptor(
         context,
+        this.config.resourceInterceptor,
+      );
+
+      /*
+       * Cookie restore.
+       */
+      await this.restoreCookies(
+        context,
+        fingerprint.id,
+        cookies,
+      );
+
+      if (this.shuttingDown) {
+        throw new Error(
+          'BrowserManager is shutting down.',
+        );
+      }
+
+      const instance: BrowserInstance = {
+        id: contextId,
+
         browser,
+        context,
+
         fingerprint,
         proxy,
+
         createdAt: new Date(),
         lastUsed: new Date(),
-        pageCount: 0,
-        cdpSession,
+
+        totalPagesCreated: 0,
+        activePages: 0,
+
+        recoveryAttempts: 0,
+
+        closing: false,
+
+        pageHandlers: new Map(),
       };
 
-      this.activeBrowsers.set(contextId, instance);
-
-      this.logger.info(`Browser launched successfully`, {
+      this.activeBrowsers.set(
         contextId,
-        activeBrowsers: this.activeBrowsers.size,
+        instance,
+      );
+
+      registered = true;
+
+      /*
+       * Existing pages.
+       */
+      for (const page of context.pages()) {
+        this.attachPageLifecycle(
+          instance,
+          page,
+        );
+      }
+
+      /*
+       * Future pages.
+       */
+      context.on('page', page => {
+        if (
+          instance.closing ||
+          !this.activeBrowsers.has(instance.id)
+        ) {
+          return;
+        }
+
+        this.attachPageLifecycle(
+          instance,
+          page,
+        );
       });
+
+      /*
+       * İlk page.
+       */
+      const page =
+        await this.createPage(context);
+
+      await page.goto(
+        'about:blank',
+      );
+
+      this.logger.info(
+        'Browser launched successfully',
+        {
+          contextId,
+          activeBrowsers:
+            this.activeBrowsers.size,
+        },
+      );
 
       return context;
 
     } catch (error) {
-      this.logger.error(`Failed to launch browser`, error as Error, {
-        contextId,
-        fingerprint: fingerprint.id,
-        proxy: proxy.url,
-      });
+      this.logger.error(
+        'Browser launch failed',
+        error as Error,
+        {
+          contextId,
+          fingerprint:
+            fingerprint.id,
+        },
+      );
+
+      if (registered) {
+        this.activeBrowsers.delete(
+          contextId,
+        );
+      }
+
+      try {
+        await context?.close();
+      } catch {
+        // ignore cleanup error
+      }
+
+      try {
+        await browser?.close();
+      } catch {
+        // ignore cleanup error
+      }
+
+      /*
+       * Launch başarısızsa slot artık kullanılmıyor.
+       */
+      if (this.activeSlots > 0) {
+        this.releaseSlot();
+      }
+
       throw error;
     }
+
+    /*
+     * Başarılı launch'ta slot burada release edilmez.
+     *
+     * Browser kapanınca closeBrowser() içinden
+     * releaseSlot() yapılır.
+     */
   }
 
-  /**
-   * CDP üzerinden stealth uygula
-   */
-  private async applyCDPStealth(cdpSession: CDPSession, fingerprint: FingerprintData): Promise<void> {
-    try {
-      // WebRTC engelle (IP leak'i önle)
-      if (this.config.resourceInterceptor.blockWebRTC) {
-        await cdpSession.send('WebRTC.disable');
-      }
+  /* =======================================================
+   * PAGE
+   * ======================================================= */
 
-      // Runtime.enable
-      await cdpSession.send('Runtime.enable');
-
-      // Console.log'ları yakala
-      await cdpSession.send('Console.enable');
-
-      // Network conditions (throttling simülasyonu)
-      await cdpSession.send('Network.emulateNetworkConditions', {
-        offline: false,
-        downloadThroughput: 1.5 * 1024 * 1024, // 1.5 Mbps
-        uploadThroughput: 750 * 1024, // 750 Kbps
-        latency: 50, // 50ms
-      });
-
-      // Device metrics (mobile için)
-      if (fingerprint.type === 'mobile') {
-        await cdpSession.send('Emulation.setDeviceMetricsOverride', {
-          width: fingerprint.viewport.width,
-          height: fingerprint.viewport.height,
-          deviceScaleFactor: fingerprint.pixelRatio,
-          mobile: true,
-        });
-      }
-
-      // Font families (gerçekçi font listesi)
-      await cdpSession.send('CSS.setFonts', {
-        fontFamilies: this.generateFontFamilies(fingerprint),
-      });
-
-      this.logger.debug('CDP stealth applied');
-    } catch (error) {
-      this.logger.warn('CDP stealth failed', { error: String(error) });
-    }
-  }
-
-  /**
-   * Resource Interceptor kur
-   */
-  private async setupResourceInterceptor(
+  public async createPage(
     context: BrowserContext,
-    config: Partial<ResourceInterceptorConfig>
-  ): Promise<void> {
-    await context.route('**/*', async (route: Route, request: Request) => {
-      const resourceType = request.resourceType();
-      const url = request.url();
-
-      // WebRTC engelle
-      if (config.blockWebRTC && url.includes('webrtc')) {
-        await route.abort();
-        return;
-      }
-
-      // Gereksiz kaynakları engelle
-      if (config.blockImages && resourceType === 'image') {
-        await route.abort();
-        return;
-      }
-
-      if (config.blockFonts && resourceType === 'font') {
-        await route.abort();
-        return;
-      }
-
-      if (config.blockMedia && ['media', 'video', 'audio'].includes(resourceType)) {
-        await route.abort();
-        return;
-      }
-
-      if (config.blockCSS && resourceType === 'stylesheet') {
-        await route.abort();
-        return;
-      }
-
-      // Analytics/tracking engelle
-      if (url.includes('google-analytics') || 
-          url.includes('googletagmanager') ||
-          url.includes('facebook.com/tr') ||
-          url.includes('analytics')) {
-        await route.abort();
-        return;
-      }
-
-      await route.continue();
-    });
-
-    this.logger.debug('Resource interceptor configured');
-  }
-
-  /**
-   * Lifecycle Manager kur
-   */
-  private async setupLifecycleManager(
-    context: BrowserContext,
-    config: Partial<LifecycleConfig>
-  ): Promise<void> {
-    // Crash handling
-    context.on('crashed', async (event) => {
-      this.logger.error('Browser crashed', null, { event });
-      if (config.crashRecovery) {
-        await this.handleCrash(context);
-      }
-    });
-
-    // Dialog handling
-    if (config.dialogHandling) {
-      context.on('dialog', async (dialog) => {
-        this.logger.debug(`Dialog appeared: ${dialog.type()}`);
-        await dialog.dismiss();
-      });
-    }
-
-    // Page error handling
-    context.on('pageerror', (error) => {
-      this.logger.warn('Page error', { error: error.message });
-    });
-
-    // Request failed handling
-    context.on('requestfailed', (request) => {
-      this.logger.debug(`Request failed: ${request.url()}`);
-    });
-
-    this.logger.debug('Lifecycle manager configured');
-  }
-
-  /**
-   * Crash recovery handler
-   */
-  private async handleCrash(context: BrowserContext): Promise<void> {
-    const contextId = this.findContextId(context);
-    if (!contextId) return;
-
-    const attempts = this.recoveryAttempts.get(contextId) || 0;
-    
-    if (attempts >= this.config.lifecycle.maxRecoveryAttempts) {
-      this.logger.error('Max recovery attempts reached, closing browser');
-      await this.closeBrowser(context, false);
-      return;
-    }
-
-    this.recoveryAttempts.set(contextId, attempts + 1);
-    this.logger.warn(`Attempting crash recovery (${attempts + 1}/${this.config.lifecycle.maxRecoveryAttempts})`);
-
-    try {
-      // Yeni page aç
-      const page = await context.newPage();
-      await page.goto('about:blank');
-      this.logger.info('Crash recovery successful');
-    } catch (error) {
-      this.logger.error('Crash recovery failed', error as Error);
-      await this.closeBrowser(context, false);
-    }
-  }
-
-  /**
-   * Stealth scripts uygula (runtime)
-   */
-  private async applyStealthScripts(
-    context: BrowserContext,
-    fingerprint: FingerprintData
-  ): Promise<void> {
-    // Runtime fingerprint randomizer
-    const randomCanvasNoise = () => Math.random() * 0.02 - 0.01;
-    const randomFontOffset = () => Math.floor(Math.random() * 3);
-
-    await context.addInitScript(`
-      // Webdriver kaldır
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined,
-        configurable: true,
-      });
-
-      // Chrome runtime
-      Object.defineProperty(window, 'chrome', {
-        get: () => ({
-          runtime: {
-            OnInstalledReason: { CHROME_UPDATE: 'chrome_update' },
-            OnRestartRequiredReason: { APP_UPDATE: 'app_update' },
-            PlatformArch: { X86_64: 'x86-64' },
-            PlatformNaclArch: { X86_64: 'x86-64' },
-            PlatformOs: { ${fingerprint.platform.toUpperCase()}: '${fingerprint.platform.toLowerCase()}' },
-            RequestUpdateCheckStatus: { NO_UPDATE: 'no_update' },
-          },
-          loadTimes: () => ({
-            commitLoadTime: performance.now() / 1000,
-            connectionInfo: 'h2',
-            finishDocumentLoadTime: performance.now() / 1000,
-            finishLoadTime: performance.now() / 1000,
-            firstPaintAfterLoadTime: 0,
-            firstPaintTime: performance.now() / 1000,
-            navigationType: 'Other',
-            npnNegotiatedProtocol: 'h2',
-            requestTime: performance.now() / 1000,
-            startLoadTime: performance.now() / 1000,
-            wasAlternateProtocolAvailable: false,
-            wasFetchedViaSpdy: true,
-            wasNpnNegotiated: true,
-          }),
-          csi: () => ({
-            onloadT: Date.now(),
-            pageT: Date.now() - performance.timing.navigationStart,
-            startE: performance.timing.navigationStart,
-          }),
-          app: {},
-        }),
-        configurable: true,
-      });
-
-      // Plugins (gerçekçi liste)
-      const generatePlugins = () => {
-        const plugins = [
-          {
-            name: 'Chrome PDF Plugin',
-            filename: 'internal-pdf-viewer',
-            description: 'Portable Document Format',
-            version: 'undefined',
-            length: 2,
-            item: (index) => plugins[0],
-          },
-          {
-            name: 'Widevine Content Decryption Module',
-            filename: 'widevinecdmadapter.dll',
-            description: 'Widevine Content Decryption Module',
-            version: '4.10.2710.0',
-          },
-          {
-            name: 'Native Client',
-            filename: 'internal-nacl-plugin',
-            description: 'Native Client module',
-          },
-        ];
-        plugins.length = 3;
-        plugins.item = (index) => plugins[index];
-        plugins.namedItem = (name) => plugins.find(p => p.name === name);
-        return plugins;
-      };
-
-      Object.defineProperty(navigator, 'plugins', {
-        get: generatePlugins,
-        configurable: true,
-      });
-
-      // MimeTypes
-      Object.defineProperty(navigator, 'mimeTypes', {
-        get: () => [
-          { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: navigator.plugins[0] },
-          { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: navigator.plugins[0] },
-        ],
-        configurable: true,
-      });
-
-      // Canvas noise (fingerprint randomization)
-      const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-      CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
-        const imageData = originalGetImageData.call(this, x, y, w, h);
-        const data = imageData.data;
-        for (let i = 0; i < data.length; i += 4) {
-          data[i] = Math.max(0, Math.min(255, data[i] + ${randomCanvasNoise}));
-          data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + ${randomCanvasNoise}));
-          data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + ${randomCanvasNoise}));
-        }
-        return imageData;
-      };
-
-      // WebGL spoofing
-      const getParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) return '${fingerprint.webGL?.vendor || 'Google Inc.'}';
-        if (parameter === 37446) return '${fingerprint.webGL?.renderer || 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)'}';
-        return getParameter(parameter);
-      };
-
-      // Notification
-      Object.defineProperty(Notification, 'permission', {
-        get: () => 'default',
-        configurable: true,
-      });
-
-      // Permissions
-      const originalQuery = navigator.permissions.query;
-      navigator.permissions.query = (parameters) => {
-        if (parameters.name === 'notifications') {
-          return Promise.resolve({ state: 'default', onchange: null });
-        }
-        return originalQuery(parameters);
-      };
-
-      // Device memory
-      Object.defineProperty(navigator, 'deviceMemory', {
-        get: () => ${fingerprint.deviceMemory},
-        configurable: true,
-      });
-
-      // Hardware concurrency
-      Object.defineProperty(navigator, 'hardwareConcurrency', {
-        get: () => ${fingerprint.hardwareConcurrency},
-        configurable: true,
-      });
-
-      // Platform
-      Object.defineProperty(navigator, 'platform', {
-        get: () => '${fingerprint.platform}',
-        configurable: true,
-      });
-
-      // Max touch points
-      Object.defineProperty(navigator, 'maxTouchPoints', {
-        get: () => ${fingerprint.maxTouchPoints},
-        configurable: true,
-      });
-
-      // PDF viewer
-      Object.defineProperty(navigator, 'pdfViewerEnabled', {
-        get: () => true,
-        configurable: true,
-      });
-
-      // Connection API
-      Object.defineProperty(navigator, 'connection', {
-        get: () => ({
-          effectiveType: '${fingerprint.network.effectiveType}',
-          downlink: ${fingerprint.network.downlink},
-          rtt: ${fingerprint.network.rtt},
-          saveData: false,
-          type: '${fingerprint.network.effectiveType}',
-        }),
-        configurable: true,
-      });
-
-      // Battery API (mobile)
-      ${fingerprint.type === 'mobile' ? `
-      Object.defineProperty(navigator, 'getBattery', {
-        get: () => () => Promise.resolve({
-          charging: true,
-          chargingTime: 0,
-          dischargingTime: Infinity,
-          level: 0.85,
-          addEventListener: () => {},
-          removeEventListener: () => {},
-        }),
-        configurable: true,
-      });
-      ` : ''}
-
-      // Screen
-      Object.defineProperty(screen, 'width', {
-        get: () => ${fingerprint.screenResolution?.width || fingerprint.viewport.width},
-        configurable: true,
-      });
-      Object.defineProperty(screen, 'height', {
-        get: () => ${fingerprint.screenResolution?.height || fingerprint.viewport.height},
-        configurable: true,
-      });
-      Object.defineProperty(screen, 'availWidth', {
-        get: () => ${fingerprint.screenResolution?.width || fingerprint.viewport.width},
-        configurable: true,
-      });
-      Object.defineProperty(screen, 'availHeight', {
-        get: () => ${(fingerprint.screenResolution?.height || fingerprint.viewport.height) - 40},
-        configurable: true,
-      });
-      Object.defineProperty(screen, 'colorDepth', {
-        get: () => ${fingerprint.colorDepth},
-        configurable: true,
-      });
-      Object.defineProperty(screen, 'pixelDepth', {
-        get: () => ${fingerprint.colorDepth},
-        configurable: true,
-      });
-
-      // Outer window dimensions (gerçekçi)
-      Object.defineProperty(window, 'outerWidth', {
-        get: () => ${fingerprint.viewport.width} + ${Math.floor(Math.random() * 20 + 10)},
-        configurable: true,
-      });
-      Object.defineProperty(window, 'outerHeight', {
-        get: () => ${fingerprint.viewport.height} + ${Math.floor(Math.random() * 100 + 80)},
-        configurable: true,
-      });
-
-      // Webdriver property tamamen kaldır
-      delete navigator.webdriver;
-
-      // Automation flags
-      Object.defineProperty(navigator, 'automationControlled', {
-        get: () => false,
-        configurable: true,
-      });
-
-      // PluginArray ve MimeTypeArray constructor'larını gizle
-      Object.setPrototypeOf(navigator.plugins, PluginArray.prototype);
-      Object.setPrototypeOf(navigator.mimeTypes, MimeTypeArray.prototype);
-    `);
-
-    this.logger.debug(`Stealth scripts applied for ${fingerprint.id}`);
-  }
-
-  /**
-   * Sec-CH-UA header'ı üret
-   */
-  private generateSecCHUA(fingerprint: FingerprintData): string {
-    const brands = [
-      '"Not_A Brand";v="99"',
-      '"Chromium";v="120"',
-      '"Google Chrome";v="120"',
-    ];
-    return brands.join(', ');
-  }
-
-  /**
-   * Font families üret
-   */
-  private generateFontFamilies(fingerprint: FingerprintData): string[] {
-    const baseFonts = ['Arial', 'Helvetica', 'Times New Roman', 'Courier New', 'Georgia'];
-    const systemFonts = fingerprint.type === 'mobile' 
-      ? ['-apple-system', 'BlinkMacSystemFont', 'Segoe UI']
-      : ['Segoe UI', 'Microsoft YaHei', 'Tahoma'];
-    return [...baseFonts, ...systemFonts];
-  }
-
-  /**
-   * Yeni sayfa oluştur
-   */
-  public async createPage(context: BrowserContext): Promise<Page> {
-    const instance = this.findInstanceByContext(context);
-    
-    try {
-      const page = await context.newPage();
-      
-      // Timeout ayarla
-      page.setDefaultTimeout(this.config.defaultTimeout);
-      page.setDefaultNavigationTimeout(this.config.lifecycle.navigationTimeout);
-
-      // Bot detection test
-      const isBotDetected = await this.checkBotDetection(page);
-      if (isBotDetected) {
-        this.logger.warn('Bot detection triggered, applying additional stealth...');
-        await this.applyEmergencyStealth(page);
-      }
-
-      // Instance güncelle
-      if (instance) {
-        instance.pageCount++;
-        instance.lastUsed = new Date();
-      }
-
-      this.logger.debug(`New page created`, {
-        contextId: instance ? this.findContextId(context) : 'unknown',
-      });
-
-      return page;
-
-    } catch (error) {
-      this.logger.error(`Failed to create page`, error as Error);
-      throw error;
-    }
-  }
-
-  /**
-   * Bot detection kontrolü
-   */
-  private async checkBotDetection(page: Page): Promise<boolean> {
-    try {
-      const botIndicators = await page.evaluate(() => {
-        const indicators: string[] = [];
-        
-        // Webdriver check
-        if ((navigator as any).webdriver) indicators.push('webdriver');
-        
-        // Chrome check
-        if (!(window as any).chrome) indicators.push('no_chrome');
-        
-        // Plugins check
-        if (navigator.plugins.length === 0) indicators.push('no_plugins');
-        
-        // User agent check
-        if (navigator.userAgent.includes('HeadlessChrome')) indicators.push('headless_ua');
-        
-        // Automation check
-        if ((navigator as any).automationControlled) indicators.push('automation');
-        
-        // Notification permission
-        if (Notification.permission !== 'default') indicators.push('notification_permission');
-        
-        return indicators;
-      });
-
-      if (botIndicators.length > 0) {
-        this.logger.warn('Bot indicators detected', { indicators: botIndicators });
-      }
-
-      return botIndicators.length > 0;
-
-    } catch (error) {
-      return false;
-    }
-  }
-
-  /**
-   * Acil stealth uygula
-   */
-  private async applyEmergencyStealth(page: Page): Promise<void> {
-    await page.evaluate(() => {
-      // Ekstra evasion
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => [
-          { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-          { name: 'Widevine Content Decryption Module', filename: 'widevinecdmadapter.dll' },
-          { name: 'Native Client', filename: 'internal-nacl-plugin' },
-        ],
-      });
-
-      Object.defineProperty(Notification, 'permission', {
-        get: () => 'default',
-      });
-    });
-  }
-
-  /**
-   * Browser context'i kapat
-   */
-  public async closeBrowser(context: BrowserContext, saveCookies: boolean = true): Promise<void> {
-    const contextId = this.findContextId(context);
-    const instance = contextId ? this.activeBrowsers.get(contextId) : undefined;
-
-    try {
-      // Cookie'leri kaydet
-      if (saveCookies && instance) {
-        const cookies = await context.cookies();
-        this.cookieCache.set(instance.fingerprint.id, cookies);
-        await this.saveCookies(instance.fingerprint.id, cookies);
-      }
-
-      // CDP session kapat
-      if (instance?.cdpSession) {
-        await instance.cdpSession.detach().catch(() => {});
-      }
-
-      // Context'i kapat
-      await context.close();
-
-      // Browser'ı kapat
-      if (instance?.browser) {
-        await instance.browser.close();
-      }
-
-      // Instance'ı temizle
-      if (contextId) {
-        this.activeBrowsers.delete(contextId);
-        this.recoveryAttempts.delete(contextId);
-      }
-
-      this.logger.info(`Browser closed`, {
-        contextId,
-        activeBrowsers: this.activeBrowsers.size,
-      });
-
-    } catch (error) {
-      this.logger.error(`Error closing browser`, error as Error);
-      throw error;
-    }
-  }
-
-  /**
-   * Tüm browser'ları kapat
-   */
-  public async closeAll(): Promise<void> {
-    this.logger.info(`Closing all browsers (${this.activeBrowsers.size} active)...`);
-
-    const promises: Promise<void>[] = [];
-
-    for (const [contextId, instance] of this.activeBrowsers) {
-      promises.push(
-        this.closeBrowser(instance.context, true).catch(error => {
-          this.logger.error(`Error closing browser ${contextId}`, error as Error);
-        })
+  ): Promise<Page> {
+    const instance =
+      this.findInstanceByContext(context);
+
+    if (!instance) {
+      throw new Error(
+        'BrowserContext is not managed by this BrowserManager.',
       );
     }
 
-    await Promise.all(promises);
-
-    this.logger.info('All browsers closed');
-  }
-
-  /**
-   * Cookie'leri kaydet
-   */
-  private async saveCookies(fingerprintId: string, cookies: any[]): Promise<void> {
-    try {
-      const filePath = join(this.config.cookieDir, `${fingerprintId}.json`);
-      writeFileSync(filePath, JSON.stringify(cookies, null, 2));
-    } catch (error) {
-      this.logger.error(`Failed to save cookies for ${fingerprintId}`, error as Error);
+    if (instance.closing) {
+      throw new Error(
+        'Browser instance is closing.',
+      );
     }
+
+    const page =
+      await context.newPage();
+
+    /*
+     * Timeout settings.
+     */
+    page.setDefaultTimeout(
+      this.config.lifecycle.defaultTimeout,
+    );
+
+    page.setDefaultNavigationTimeout(
+      this.config.lifecycle.navigationTimeout,
+    );
+
+    /*
+     * newPage() gerçek Playwright/Patchright'ta
+     * "page" event'i de tetikleyebilir.
+     *
+     * attachPageLifecycle duplicate-safe olduğu için
+     * burada ikinci kez attach edilmesi güvenlidir.
+     */
+    this.attachPageLifecycle(
+      instance,
+      page,
+    );
+
+    instance.lastUsed =
+      new Date();
+
+    return page;
   }
 
-  /**
-   * Cookie'leri yükle
-   */
-  public loadCookies(fingerprintId: string): any[] {
-    try {
-      const filePath = join(this.config.cookieDir, `${fingerprintId}.json`);
-      if (existsSync(filePath)) {
-        const data = readFileSync(filePath, 'utf-8');
-        return JSON.parse(data);
+  /* =======================================================
+   * PAGE LIFECYCLE
+   * ======================================================= */
+
+  private attachPageLifecycle(
+    instance: BrowserInstance,
+    page: Page,
+  ): void {
+    if (
+      instance.closing ||
+      instance.pageHandlers.has(page)
+    ) {
+      return;
+    }
+
+    instance.activePages++;
+    instance.totalPagesCreated++;
+    instance.lastUsed = new Date();
+
+    const crash = () => {
+      this.handlePageCrash(
+        instance,
+        page,
+      ).catch(error => {
+        this.logger.error(
+          'Crash handler failed',
+          error as Error,
+        );
+      });
+    };
+
+    const close = () => {
+      const handlers =
+        instance.pageHandlers.get(page);
+
+      if (!handlers) {
+        return;
       }
-    } catch (error) {
-      this.logger.error(`Failed to load cookies for ${fingerprintId}`, error as Error);
+
+      instance.activePages =
+        Math.max(
+          0,
+          instance.activePages - 1,
+        );
+
+      instance.lastUsed =
+        new Date();
+
+      instance.pageHandlers.delete(
+        page,
+      );
+    };
+
+    const dialog =
+      this.config.lifecycle.dialogHandling
+        ? async (dialogObject: any) => {
+            try {
+              this.logger.debug(
+                `Dialog detected: ${dialogObject.type()}`,
+              );
+
+              await dialogObject.dismiss();
+            } catch {
+              // Page may already be closed.
+            }
+          }
+        : undefined;
+
+    const popup =
+      this.config.lifecycle.popupHandling
+        ? (popupPage: Page) => {
+            try {
+              this.logger.debug(
+                `Popup opened: ${popupPage.url()}`,
+              );
+            } catch {
+              this.logger.debug(
+                'Popup opened',
+              );
+            }
+
+            this.attachPageLifecycle(
+              instance,
+              popupPage,
+            );
+          }
+        : undefined;
+
+    const pageerror = (
+      error: Error,
+    ) => {
+      this.logger.warn(
+        `Page error: ${error.message}`,
+      );
+    };
+
+    const requestfailed = (
+      request: Request,
+    ) => {
+      this.logger.debug(
+        `Request failed: ${request.url()}`,
+      );
+    };
+
+    instance.pageHandlers.set(
+      page,
+      {
+        crash,
+        close,
+        dialog,
+        popup,
+        pageerror,
+        requestfailed,
+      },
+    );
+
+    page.on(
+      'crash',
+      crash,
+    );
+
+    page.on(
+      'close',
+      close,
+    );
+
+    if (dialog) {
+      page.on(
+        'dialog',
+        dialog,
+      );
     }
-    return [];
+
+    if (popup) {
+      page.on(
+        'popup',
+        popup,
+      );
+    }
+
+    page.on(
+      'pageerror',
+      pageerror,
+    );
+
+    page.on(
+      'requestfailed',
+      requestfailed,
+    );
   }
 
-  /**
-   * Slot bekle
-   */
-  private async waitForAvailableSlot(): Promise<void> {
-    return new Promise((resolve) => {
-      const checkInterval = setInterval(() => {
-        if (this.activeBrowsers.size < this.config.maxConcurrentBrowsers) {
-          clearInterval(checkInterval);
-          resolve();
+  /* =======================================================
+   * CRASH RECOVERY
+   * ======================================================= */
+
+  private async handlePageCrash(
+    instance: BrowserInstance,
+    page: Page,
+  ): Promise<void> {
+    if (instance.closing) {
+      return;
+    }
+
+    this.logger.error(
+      'Page crashed',
+      new Error('Page crashed'),
+      {
+        contextId: instance.id,
+        url: safePageUrl(page),
+      },
+    );
+
+    if (
+      !this.config.lifecycle.crashRecovery
+    ) {
+      return;
+    }
+
+    if (
+      instance.recoveryAttempts >=
+      this.config.lifecycle
+        .maxRecoveryAttempts
+    ) {
+      this.logger.error(
+        'Maximum recovery attempts reached',
+        new Error(
+          `Recovery failed for ${instance.id}`,
+        ),
+      );
+
+      await this.closeBrowser(
+        instance.context,
+        false,
+      );
+
+      return;
+    }
+
+    instance.recoveryAttempts++;
+
+    try {
+      const replacement =
+        await instance.context.newPage();
+
+      this.attachPageLifecycle(
+        instance,
+        replacement,
+      );
+
+      replacement.setDefaultTimeout(
+        this.config.lifecycle
+          .defaultTimeout,
+      );
+
+      replacement.setDefaultNavigationTimeout(
+        this.config.lifecycle
+          .navigationTimeout,
+      );
+
+      await replacement.goto(
+        'about:blank',
+        {
+          waitUntil:
+            'domcontentloaded',
+        },
+      );
+
+      instance.recoveryAttempts = 0;
+      instance.lastUsed = new Date();
+
+      this.logger.info(
+        'Page crash recovered',
+        {
+          contextId:
+            instance.id,
+        },
+      );
+
+    } catch (error) {
+      this.logger.error(
+        'Page crash recovery failed',
+        error as Error,
+        {
+          contextId:
+            instance.id,
+        },
+      );
+
+      await this.closeBrowser(
+        instance.context,
+        false,
+      );
+    }
+  }
+
+  /* =======================================================
+   * RESOURCE INTERCEPTION
+   * ======================================================= */
+
+  private async setupResourceInterceptor(
+    context: BrowserContext,
+    config: Partial<ResourceInterceptorConfig>,
+  ): Promise<void> {
+    await context.route(
+      '**/*',
+      async (
+        route: Route,
+        request: Request,
+      ) => {
+        try {
+          const url =
+            request.url();
+
+          if (
+            url.startsWith('about:') ||
+            url.startsWith('data:') ||
+            url.startsWith('blob:')
+          ) {
+            await route.continue();
+            return;
+          }
+
+          const hostname =
+            safeHostname(url);
+
+          if (
+            hostname &&
+            this.isAllowedDomain(
+              hostname,
+              config.allowedDomains ??
+                [],
+            )
+          ) {
+            await route.continue();
+            return;
+          }
+
+          const resourceType =
+            request.resourceType();
+
+          if (
+            config.blockTracking &&
+            hostname &&
+            this.isTrackingHost(
+              hostname,
+              config.trackingHosts ??
+                [],
+            )
+          ) {
+            await route.abort();
+            return;
+          }
+
+          if (
+            config.blockImages &&
+            resourceType === 'image'
+          ) {
+            await route.abort();
+            return;
+          }
+
+          if (
+            config.blockFonts &&
+            resourceType === 'font'
+          ) {
+            await route.abort();
+            return;
+          }
+
+          if (
+            config.blockMedia &&
+            (
+              resourceType === 'media' ||
+              resourceType === 'video' ||
+              resourceType === 'audio'
+            )
+          ) {
+            await route.abort();
+            return;
+          }
+
+          if (
+            config.blockCSS &&
+            resourceType ===
+              'stylesheet'
+          ) {
+            await route.abort();
+            return;
+          }
+
+          await route.continue();
+
+        } catch {
+          try {
+            await route.continue();
+          } catch {
+            // ignored
+          }
         }
-      }, 1000);
+      },
+    );
+  }
+
+  /* =======================================================
+   * COOKIE MANAGEMENT
+   * ======================================================= */
+
+  private async restoreCookies(
+    context: BrowserContext,
+    fingerprintId: string,
+    cookies?: Cookie[],
+  ): Promise<void> {
+    let source: Cookie[] = [];
+
+    if (cookies?.length) {
+      source = cookies;
+    } else {
+      const cached =
+        this.cookieCache.get(
+          fingerprintId,
+        );
+
+      if (cached?.length) {
+        source = cached;
+      } else {
+        source =
+          this.loadCookies(
+            fingerprintId,
+          );
+      }
+    }
+
+    if (!source.length) {
+      return;
+    }
+
+    try {
+      await context.addCookies(
+        source,
+      );
+
+      /*
+       * Cache'e aynı array referansını değil,
+       * kopyasını koyuyoruz.
+       */
+      this.cookieCache.set(
+        fingerprintId,
+        [...source],
+      );
+
+    } catch (error) {
+      this.logger.warn(
+        'Failed to restore cookies',
+        {
+          fingerprintId,
+          error: String(error),
+        },
+      );
+    }
+  }
+
+  private async saveContextCookies(
+    instance: BrowserInstance,
+  ): Promise<void> {
+    try {
+      const cookies =
+        await instance.context.cookies();
+
+      this.cookieCache.set(
+        instance.fingerprint.id,
+        [...cookies],
+      );
+
+      this.saveCookies(
+        instance.fingerprint.id,
+        cookies,
+      );
+
+    } catch (error) {
+      this.logger.warn(
+        'Failed to save cookies',
+        {
+          fingerprintId:
+            instance.fingerprint.id,
+          error: String(error),
+        },
+      );
+    }
+  }
+
+  private saveCookies(
+    fingerprintId: string,
+    cookies: Cookie[],
+  ): void {
+    try {
+      if (
+        !existsSync(
+          this.config.cookieDir,
+        )
+      ) {
+        mkdirSync(
+          this.config.cookieDir,
+          {
+            recursive: true,
+          },
+        );
+      }
+
+      const filePath =
+        join(
+          this.config.cookieDir,
+          `${fingerprintId}.json`,
+        );
+
+      writeFileSync(
+        filePath,
+        JSON.stringify(
+          cookies,
+          null,
+          2,
+        ),
+        'utf8',
+      );
+
+    } catch (error) {
+      this.logger.error(
+        'Failed to persist cookies',
+        error as Error,
+        {
+          fingerprintId,
+        },
+      );
+    }
+  }
+
+  public loadCookies(
+    fingerprintId: string,
+  ): Cookie[] {
+    try {
+      const filePath =
+        join(
+          this.config.cookieDir,
+          `${fingerprintId}.json`,
+        );
+
+      if (
+        !existsSync(filePath)
+      ) {
+        return [];
+      }
+
+      const raw =
+        readFileSync(
+          filePath,
+          'utf8',
+        );
+
+      const parsed =
+        JSON.parse(raw);
+
+      if (
+        !Array.isArray(parsed)
+      ) {
+        return [];
+      }
+
+      return parsed as Cookie[];
+
+    } catch (error) {
+      this.logger.warn(
+        'Failed to load cookies',
+        {
+          fingerprintId,
+          error: String(error),
+        },
+      );
+
+      return [];
+    }
+  }
+
+  /* =======================================================
+   * CLOSE
+   * ======================================================= */
+
+  public async closeBrowser(
+    context: BrowserContext,
+    saveCookies = true,
+  ): Promise<void> {
+    const instance =
+      this.findInstanceByContext(
+        context,
+      );
+
+    if (!instance) {
+      try {
+        await context.close();
+      } catch {
+        // ignored
+      }
+
+      return;
+    }
+
+    if (instance.closing) {
+      return;
+    }
+
+    instance.closing = true;
+
+    /*
+     * Registry'den hemen çıkar.
+     */
+    this.activeBrowsers.delete(
+      instance.id,
+    );
+
+    try {
+      if (saveCookies) {
+        await this.saveContextCookies(
+          instance,
+        );
+      }
+
+      /*
+       * Page listeners.
+       */
+      for (const [
+        page,
+        handlers,
+      ] of instance.pageHandlers) {
+        try {
+          page.off(
+            'crash',
+            handlers.crash,
+          );
+
+          page.off(
+            'close',
+            handlers.close,
+          );
+
+          if (handlers.dialog) {
+            page.off(
+              'dialog',
+              handlers.dialog,
+            );
+          }
+
+          if (handlers.popup) {
+            page.off(
+              'popup',
+              handlers.popup,
+            );
+          }
+
+          if (handlers.pageerror) {
+            page.off(
+              'pageerror',
+              handlers.pageerror,
+            );
+          }
+
+          if (handlers.requestfailed) {
+            page.off(
+              'requestfailed',
+              handlers.requestfailed,
+            );
+          }
+        } catch {
+          // ignored
+        }
+      }
+
+      instance.pageHandlers.clear();
+
+      /*
+       * Context close.
+       */
+      try {
+        await instance.context.close();
+      } catch (error) {
+        this.logger.debug(
+          `Context close warning: ${String(error)}`,
+        );
+      }
+
+      /*
+       * Browser close.
+       */
+      try {
+        await instance.browser.close();
+      } catch (error) {
+        this.logger.debug(
+          `Browser close warning: ${String(error)}`,
+        );
+      }
+
+    } finally {
+      /*
+       * En önemli concurrency düzeltmesi:
+       *
+       * Browser artık aktif değil.
+       * Dolayısıyla slot serbest bırakılır.
+       */
+      this.releaseSlot();
+
+      this.logger.info(
+        'Browser closed',
+        {
+          contextId:
+            instance.id,
+          activeBrowsers:
+            this.activeBrowsers.size,
+        },
+      );
+    }
+  }
+
+  public async closeAll(): Promise<void> {
+    /*
+     * Yeni launch'ların slot beklemesini engelle.
+     */
+    this.shuttingDown = true;
+
+    this.stopCleanupTimer();
+
+    /*
+     * Waiting launch'ları reject et.
+     */
+    this.rejectWaitingLaunches(
+      new Error(
+        'BrowserManager is shutting down.',
+      ),
+    );
+
+    const instances =
+      [
+        ...this.activeBrowsers.values(),
+      ];
+
+    this.logger.info(
+      `Closing ${instances.length} browsers`,
+    );
+
+    await Promise.all(
+      instances.map(instance =>
+        this.closeBrowser(
+          instance.context,
+          true,
+        ).catch(error => {
+          this.logger.error(
+            `Failed to close browser ${instance.id}`,
+            error as Error,
+          );
+        }),
+      ),
+    );
+
+    this.activeBrowsers.clear();
+
+    /*
+     * Güvenlik amaçlı normalize.
+     */
+    this.activeSlots = 0;
+
+    this.logger.info(
+      'BrowserManager shutdown complete',
+    );
+  }
+
+  /* =======================================================
+   * CONCURRENCY
+   * ======================================================= */
+
+  private async acquireSlot(): Promise<void> {
+    if (this.shuttingDown) {
+      throw new Error(
+        'BrowserManager is shutting down.',
+      );
+    }
+
+    if (
+      this.activeSlots <
+      this.config.maxConcurrentBrowsers
+    ) {
+      this.activeSlots++;
+      return;
+    }
+
+    await new Promise<void>(
+      (
+        resolve,
+        reject,
+      ) => {
+        this.waitingLaunches.push({
+          resolve,
+          reject,
+        });
+      },
+    );
+
+    if (this.shuttingDown) {
+      throw new Error(
+        'BrowserManager is shutting down.',
+      );
+    }
+
+    /*
+     * Slot waiter tarafından devredildi.
+     * Burada tekrar increment yapılmaz.
+     */
+  }
+
+  private releaseSlot(): void {
+    if (this.activeSlots > 0) {
+      this.activeSlots--;
+    }
+
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const waiter =
+      this.waitingLaunches.shift();
+
+    if (!waiter) {
+      return;
+    }
+
+    /*
+     * Slot waiter'a transfer edilir.
+     *
+     * activeSlots burada tekrar artırılmaz çünkü
+     * kapanan browser'ın slotu zaten decrement edilmiştir.
+     */
+    this.activeSlots++;
+
+    waiter.resolve();
+  }
+
+  private rejectWaitingLaunches(
+    error: Error,
+  ): void {
+    const waiters =
+      this.waitingLaunches.splice(
+        0,
+      );
+
+    for (const waiter of waiters) {
+      waiter.reject(error);
+    }
+  }
+
+  /* =======================================================
+   * CLEANUP
+   * ======================================================= */
+
+  private startCleanupTimer(): void {
+    const lifecycle =
+      this.config.lifecycle;
+
+    const hasIdleTimeout =
+      (lifecycle.idleTimeoutMs ??
+        0) > 0;
+
+    const hasLifetime =
+      (lifecycle.maxLifetimeMs ??
+        0) > 0;
+
+    if (
+      !hasIdleTimeout &&
+      !hasLifetime
+    ) {
+      return;
+    }
+
+    this.cleanupTimer =
+      setInterval(
+        () => {
+          this.cleanupStaleBrowsers()
+            .catch(error => {
+              this.logger.error(
+                'Browser cleanup failed',
+                error as Error,
+              );
+            });
+        },
+        30_000,
+      );
+
+    this.cleanupTimer.unref?.();
+  }
+
+  private stopCleanupTimer(): void {
+    if (!this.cleanupTimer) {
+      return;
+    }
+
+    clearInterval(
+      this.cleanupTimer,
+    );
+
+    this.cleanupTimer =
+      undefined;
+  }
+
+  private async cleanupStaleBrowsers(): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const now =
+      Date.now();
+
+    const {
+      idleTimeoutMs = 0,
+      maxLifetimeMs = 0,
+    } = this.config.lifecycle;
+
+    const toClose: BrowserInstance[] =
+      [];
+
+    for (
+      const instance of
+        this.activeBrowsers.values()
+    ) {
+      if (instance.closing) {
+        continue;
+      }
+
+      const idleFor =
+        now -
+        instance.lastUsed.getTime();
+
+      const lifetime =
+        now -
+        instance.createdAt.getTime();
+
+      const idleExpired =
+        idleTimeoutMs > 0 &&
+        idleFor >= idleTimeoutMs &&
+        instance.activePages === 0;
+
+      const lifetimeExpired =
+        maxLifetimeMs > 0 &&
+        lifetime >= maxLifetimeMs;
+
+      if (
+        idleExpired ||
+        lifetimeExpired
+      ) {
+        toClose.push(instance);
+      }
+    }
+
+    if (!toClose.length) {
+      return;
+    }
+
+    await Promise.all(
+      toClose.map(instance =>
+        this.closeBrowser(
+          instance.context,
+          true,
+        ),
+      ),
+    );
+  }
+
+  /* =======================================================
+   * DOMAIN HELPERS
+   * ======================================================= */
+
+  private isAllowedDomain(
+    hostname: string,
+    domains: string[],
+  ): boolean {
+    return domains.some(domain => {
+      const normalized =
+        domain
+          .trim()
+          .toLowerCase()
+          .replace(/^\.+/, '');
+
+      if (!normalized) {
+        return false;
+      }
+
+      return (
+        hostname === normalized ||
+        hostname.endsWith(
+          `.${normalized}`,
+        )
+      );
     });
   }
 
-  /**
-   * Context ID bul
-   */
-  private findContextId(context: BrowserContext): string | undefined {
-    for (const [id, instance] of this.activeBrowsers) {
-      if (instance.context === context) {
-        return id;
+  private isTrackingHost(
+    hostname: string,
+    hosts: string[],
+  ): boolean {
+    return hosts.some(host => {
+      const normalized =
+        host
+          .trim()
+          .toLowerCase()
+          .replace(/^\.+/, '');
+
+      if (!normalized) {
+        return false;
       }
-    }
-    return undefined;
+
+      return (
+        hostname === normalized ||
+        hostname.endsWith(
+          `.${normalized}`,
+        )
+      );
+    });
   }
 
-  /**
-   * Instance bul
-   */
-  private findInstanceByContext(context: BrowserContext): BrowserInstance | undefined {
-    for (const instance of this.activeBrowsers.values()) {
-      if (instance.context === context) {
+  /* =======================================================
+   * INSTANCE HELPERS
+   * ======================================================= */
+
+  private findInstanceByContext(
+    context: BrowserContext,
+  ): BrowserInstance | undefined {
+    for (
+      const instance of
+        this.activeBrowsers.values()
+    ) {
+      if (
+        instance.context === context
+      ) {
         return instance;
       }
     }
+
     return undefined;
   }
 
-  /**
-   * ID üret
-   */
   private generateContextId(): string {
-    return `ctx-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    return [
+      'ctx',
+      Date.now().toString(36),
+      Math.random()
+        .toString(36)
+        .slice(2, 10),
+    ].join('-');
   }
 
-  /**
-   * Proxy URL maskele
-   */
-  private maskProxyUrl(url: string): string {
+  /* =======================================================
+   * PROXY
+   * ======================================================= */
+
+  private parseProxy(
+    value: string,
+  ): {
+    server: string;
+    username?: string;
+    password?: string;
+  } {
+    const url =
+      new URL(value);
+
+    if (
+      ![
+        'http:',
+        'https:',
+        'socks4:',
+        'socks5:',
+      ].includes(
+        url.protocol,
+      )
+    ) {
+      throw new Error(
+        `Unsupported proxy protocol: ${url.protocol}`,
+      );
+    }
+
+    return {
+      server:
+        `${url.protocol}//${url.hostname}` +
+        `${
+          url.port
+            ? `:${url.port}`
+            : ''
+        }`,
+
+      username:
+        url.username
+          ? decodeURIComponent(
+              url.username,
+            )
+          : undefined,
+
+      password:
+        url.password
+          ? decodeURIComponent(
+              url.password,
+            )
+          : undefined,
+    };
+  }
+
+  private maskProxyUrl(
+    value: string,
+  ): string {
     try {
-      const parsed = new URL(url);
-      const auth = parsed.username ? `${parsed.username}:****@` : '';
-      return `${parsed.protocol}//${auth}${parsed.hostname}:${parsed.port}`;
+      const url =
+        new URL(value);
+
+      const auth =
+        url.username
+          ? `${url.username}:****@`
+          : '';
+
+      return (
+        `${url.protocol}//` +
+        `${auth}` +
+        `${url.hostname}` +
+        `${
+          url.port
+            ? `:${url.port}`
+            : ''
+        }`
+      );
+
     } catch {
-      return url.substring(0, 20) + '...';
+      return '[invalid-proxy]';
     }
   }
 
-  /**
-   * Aktif browser sayısı
-   */
+  /* =======================================================
+   * SCREENSHOT
+   * ======================================================= */
+
+  public async takeScreenshot(
+    page: Page,
+    name: string,
+  ): Promise<void> {
+    if (
+      !this.config.debugMode
+    ) {
+      return;
+    }
+
+    try {
+      const directory =
+        join(
+          this.config.userDataDir,
+          'screenshots',
+        );
+
+      if (
+        !existsSync(directory)
+      ) {
+        mkdirSync(
+          directory,
+          {
+            recursive: true,
+          },
+        );
+      }
+
+      const safeName =
+        name
+          .replace(
+            /[^a-zA-Z0-9._-]/g,
+            '_',
+          )
+          .slice(0, 100);
+
+      const filePath =
+        join(
+          directory,
+          `${Date.now()}-${safeName}.png`,
+        );
+
+      await page.screenshot({
+        path: filePath,
+        fullPage: true,
+      });
+
+      this.logger.debug(
+        `Screenshot saved: ${filePath}`,
+      );
+
+    } catch (error) {
+      this.logger.error(
+        'Screenshot failed',
+        error as Error,
+      );
+    }
+  }
+
+  /* =======================================================
+   * STATS
+   * ======================================================= */
+
   public getActiveBrowserCount(): number {
     return this.activeBrowsers.size;
   }
 
-  /**
-   * İstatistikler
-   */
   public getStats(): {
     active: number;
     maxAllowed: number;
-    totalPages: number;
+    totalPagesCreated: number;
+    activePages: number;
     oldestBrowser: Date | null;
   } {
-    let totalPages = 0;
-    let oldestDate: Date | null = null;
+    let totalPagesCreated = 0;
+    let activePages = 0;
+    let oldestBrowser:
+      Date | null = null;
 
-    for (const instance of this.activeBrowsers.values()) {
-      totalPages += instance.pageCount;
-      if (!oldestDate || instance.createdAt < oldestDate) {
-        oldestDate = instance.createdAt;
+    for (
+      const instance of
+        this.activeBrowsers.values()
+    ) {
+      totalPagesCreated +=
+        instance.totalPagesCreated;
+
+      activePages +=
+        instance.activePages;
+
+      if (
+        !oldestBrowser ||
+        instance.createdAt <
+          oldestBrowser
+      ) {
+        oldestBrowser =
+          instance.createdAt;
       }
     }
 
     return {
-      active: this.activeBrowsers.size,
-      maxAllowed: this.config.maxConcurrentBrowsers,
-      totalPages,
-      oldestBrowser: oldestDate,
+      active:
+        this.activeBrowsers.size,
+
+      maxAllowed:
+        this.config.maxConcurrentBrowsers,
+
+      totalPagesCreated,
+
+      activePages,
+
+      oldestBrowser,
     };
-  }
-
-  /**
-   * Screenshot al
-   */
-  public async takeScreenshot(page: Page, name: string): Promise<void> {
-    if (!this.config.debugMode) return;
-
-    try {
-      const fileName = `${Date.now()}-${name}.png`;
-      const filePath = join(this.config.userDataDir, 'screenshots', fileName);
-      
-      if (!existsSync(join(this.config.userDataDir, 'screenshots'))) {
-        mkdirSync(join(this.config.userDataDir, 'screenshots'), { recursive: true });
-      }
-
-      await page.screenshot({ path: filePath, fullPage: true });
-      this.logger.debug(`Screenshot saved: ${fileName}`);
-    } catch (error) {
-      this.logger.error('Screenshot failed', error as Error);
-    }
   }
 }
 
-// ==========================================
-// FACTORY PATTERN
-// ==========================================
+/* =========================================================
+ * SAFE HELPERS
+ * ======================================================= */
 
-const instances: Map<string, BrowserManager> = new Map();
+function safeHostname(
+  value: string,
+): string | null {
+  try {
+    return new URL(value)
+      .hostname
+      .toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function safePageUrl(
+  page: Page,
+): string {
+  try {
+    return page.url();
+  } catch {
+    return '[unknown]';
+  }
+}
+
+/* =========================================================
+ * FACTORY
+ * ======================================================= */
+
+const managers =
+  new Map<string, BrowserManager>();
 
 export function createBrowserManager(
-  name: string = 'default',
+  name = 'default',
   config?: Partial<BrowserManagerConfig>,
-  logger?: Logger
+  logger?: Logger,
 ): BrowserManager {
-  instances.get(name)?.closeAll();
-  const manager = new BrowserManager(config, logger);
-  instances.set(name, manager);
+  if (
+    managers.has(name)
+  ) {
+    throw new Error(
+      `BrowserManager "${name}" already exists.`,
+    );
+  }
+
+  const manager =
+    new BrowserManager(
+      config,
+      logger,
+    );
+
+  managers.set(
+    name,
+    manager,
+  );
+
   return manager;
 }
 
-export function getNamedBrowserManager(name: string = 'default'): BrowserManager | undefined {
-  return instances.get(name);
+export function getNamedBrowserManager(
+  name = 'default',
+): BrowserManager | undefined {
+  return managers.get(name);
 }
 
-export function closeNamedBrowserManager(name: string = 'default'): void {
-  instances.get(name)?.closeAll();
-  instances.delete(name);
-}
+export async function closeNamedBrowserManager(
+  name = 'default',
+): Promise<void> {
+  const manager =
+    managers.get(name);
 
-export function closeAllBrowserManagers(): void {
-  for (const manager of instances.values()) {
-    manager.closeAll();
+  if (!manager) {
+    return;
   }
-  instances.clear();
+
+  managers.delete(name);
+
+  await manager.closeAll();
 }
 
-// Singleton (geriye uyumluluk)
-let singletonInstance: BrowserManager | null = null;
+export async function closeAllBrowserManagers(): Promise<void> {
+  const current =
+    [
+      ...managers.entries(),
+    ];
 
-export function getBrowserManager(config?: Partial<BrowserManagerConfig>, logger?: Logger): BrowserManager {
-  if (!singletonInstance) {
-    singletonInstance = new BrowserManager(config, logger);
+  managers.clear();
+
+  await Promise.all(
+    current.map(
+      async ([
+        _name,
+        manager,
+      ]) => {
+        try {
+          await manager.closeAll();
+        } catch {
+          // Individual manager failure
+          // diğerlerini engellemesin.
+        }
+      },
+    ),
+  );
+}
+
+/* =========================================================
+ * SINGLETON
+ * ======================================================= */
+
+let singletonInstance:
+  BrowserManager | null = null;
+
+export function getBrowserManager(
+  config?: Partial<BrowserManagerConfig>,
+  logger?: Logger,
+): BrowserManager {
+  if (
+    !singletonInstance
+  ) {
+    singletonInstance =
+      new BrowserManager(
+        config,
+        logger,
+      );
   }
+
   return singletonInstance;
 }
 
-export function resetBrowserManager(): Promise<void> {
-  if (singletonInstance) {
-    return singletonInstance.closeAll().then(() => {
-      singletonInstance = null;
-    });
+export async function resetBrowserManager(): Promise<void> {
+  if (
+    !singletonInstance
+  ) {
+    return;
   }
-  return Promise.resolve();
+
+  const instance =
+    singletonInstance;
+
+  singletonInstance = null;
+
+  await instance.closeAll();
 }

@@ -1,755 +1,2143 @@
 /**
- * BrowserManager Test Suite - Patchright Tabanlı
- * 
- * Özellikler:
- * - Patchright mock'lanır (gerçek browser açılmaz)
- * - CDP session mock'lanır
- * - Resource interceptor test edilir
- * - Lifecycle manager (crash recovery) test edilir
- * - Stealth scripts doğrulanır
+ * BrowserManager.test.ts
+ *
+ * BrowserManager için gerçek browser başlatmadan çalışan
+ * deterministic Jest unit testleri.
+ *
+ * Test edilen başlıklar:
+ * - Manager oluşturma
+ * - Browser launch
+ * - Proxy parsing
+ * - Context/page lifecycle
+ * - Timeout ayarları
+ * - Cookie restore
+ * - Cookie persistence
+ * - Resource interception
+ * - Allowed domain
+ * - Tracking blocking
+ * - Screenshot
+ * - Statistics
+ * - Browser close
+ * - Factory
+ * - Singleton
+ * - Invalid proxy
+ * - Concurrency
  */
-import { BrowserContext } from 'patchright';
+
+import { EventEmitter } from 'events';
+
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+/* =========================================================
+ * MOCK TYPES
+ * ======================================================= */
+
+type MockPage = EventEmitter & {
+  setDefaultTimeout: jest.Mock;
+  setDefaultNavigationTimeout: jest.Mock;
+  goto: jest.Mock;
+  screenshot: jest.Mock;
+  url: jest.Mock;
+  off: jest.Mock;
+};
+
+type MockContext = EventEmitter & {
+  pages: jest.Mock;
+  newPage: jest.Mock;
+  route: jest.Mock;
+  addCookies: jest.Mock;
+  cookies: jest.Mock;
+  close: jest.Mock;
+
+  __routeHandler?: (
+    route: MockRoute,
+    request: MockRequest,
+  ) => Promise<void>;
+};
+
+type MockBrowser = {
+  close: jest.Mock;
+};
+
+type MockRoute = {
+  continue: jest.Mock;
+  abort: jest.Mock;
+};
+
+type MockRequest = {
+  url: jest.Mock;
+  resourceType: jest.Mock;
+};
+
+/* =========================================================
+ * PATCHRIGHT MOCK
+ * ======================================================= */
+
+let mockBrowser: MockBrowser;
+let mockContext: MockContext;
+let mockPages: MockPage[];
+
+function createMockPage(
+  url = 'about:blank',
+): MockPage {
+  const page =
+    new EventEmitter() as MockPage;
+
+  page.setDefaultTimeout =
+    jest.fn();
+
+  page.setDefaultNavigationTimeout =
+    jest.fn();
+
+  page.goto =
+    jest.fn().mockResolvedValue(
+      undefined,
+    );
+
+  page.screenshot =
+    jest.fn().mockResolvedValue(
+      undefined,
+    );
+
+  page.url =
+    jest.fn().mockReturnValue(
+      url,
+    );
+
+  page.off =
+    jest.fn(
+      EventEmitter.prototype.removeListener.bind(
+        page,
+      ),
+    );
+
+  return page;
+}
+
+function createMockContext(): MockContext {
+  const context =
+    new EventEmitter() as MockContext;
+
+  mockPages = [];
+
+  context.pages =
+    jest.fn(
+      () => mockPages,
+    );
+
+  context.newPage =
+    jest.fn(
+      async () => {
+        const page =
+          createMockPage();
+
+        mockPages.push(page);
+
+        /*
+         * Gerçek Playwright'da context
+         * "page" event'i üretir.
+         */
+        context.emit(
+          'page',
+          page,
+        );
+
+        return page;
+      },
+    );
+
+  context.route =
+    jest.fn(
+      async (
+        _pattern: string,
+        handler: (
+          route: MockRoute,
+          request: MockRequest,
+        ) => Promise<void>,
+      ) => {
+        context.__routeHandler =
+          handler;
+      },
+    );
+
+  context.addCookies =
+    jest.fn().mockResolvedValue(
+      undefined,
+    );
+
+  context.cookies =
+    jest.fn().mockResolvedValue(
+      [],
+    );
+
+  context.close =
+    jest.fn().mockResolvedValue(
+      undefined,
+    );
+
+  return context;
+}
+
+jest.mock('patchright', () => {
+  return {
+    chromium: {
+      launch: jest.fn(
+        async () => {
+          mockBrowser = {
+            close:
+              jest.fn().mockResolvedValue(
+                undefined,
+              ),
+          };
+
+          mockContext =
+            createMockContext();
+
+          return {
+            ...mockBrowser,
+
+            newContext:
+              jest.fn(
+                async () =>
+                  mockContext,
+              ),
+          };
+        },
+      ),
+    },
+  };
+});
+
+/* =========================================================
+ * LOGGER MOCK
+ * ======================================================= */
+
+jest.mock(
+  '../../../src/utils/logger',
+  () => {
+    const logger = {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    };
+
+    return {
+      Logger: jest.fn(),
+      getLogger: jest.fn(
+        () => logger,
+      ),
+    };
+  },
+);
+
+/* =========================================================
+ * IMPORT AFTER MOCKS
+ * ======================================================= */
 
 import {
   BrowserManager,
-  BrowserManagerConfig,
-  resetBrowserManager,
-  createBrowserManager,
-  getNamedBrowserManager,
-  closeNamedBrowserManager,
   closeAllBrowserManagers,
+  closeNamedBrowserManager,
+  createBrowserManager,
+  getBrowserManager,
+  getNamedBrowserManager,
+  resetBrowserManager,
 } from '../../../src/core/browser-manager';
-import { Logger } from '../../../src/utils/logger';
-import { FingerprintData } from '../../../src/types';
-import { ProxyStatus } from '../../../src/core/proxy-manager';
 
-// Patchright mock
-const mockCDPSession = {
-  send: jest.fn().mockResolvedValue(undefined),
-  detach: jest.fn().mockResolvedValue(undefined),
-};
+import { chromium } from 'patchright';
 
-const mockPage = {
-  setDefaultTimeout: jest.fn(),
-  setDefaultNavigationTimeout: jest.fn(),
-  evaluate: jest.fn().mockResolvedValue([]),
-  screenshot: jest.fn().mockResolvedValue(undefined),
-  close: jest.fn().mockResolvedValue(undefined),
-  context: jest.fn().mockReturnValue({
-    newCDPSession: jest.fn().mockResolvedValue(mockCDPSession),
-  }),
-  goto: jest.fn().mockResolvedValue(undefined),
-};
+/* =========================================================
+ * FIXTURES
+ * ======================================================= */
 
-const mockContext = {
-  newPage: jest.fn().mockResolvedValue(mockPage),
-  addCookies: jest.fn(),
-  cookies: jest.fn().mockResolvedValue([]),
-  close: jest.fn(),
-  route: jest.fn(),
-  on: jest.fn(),
-  // Eksik property'ler eklendi:
-  addInitScript: jest.fn(),
-  exposeBinding: jest.fn(),
-  removeAllListeners: jest.fn(),
-  once: jest.fn(),
-  addLocatorHandler: jest.fn(),
-  clearCookies: jest.fn(),
-  grantPermissions: jest.fn(),
-  clearPermissions: jest.fn(),
-  setGeolocation: jest.fn(),
-  setExtraHTTPHeaders: jest.fn(),
-  setOffline: jest.fn(),
-  waitForEvent: jest.fn(),
-  pages: jest.fn().mockReturnValue([]),
-  browser: jest.fn().mockReturnValue({}),
-  tracing: {
-    start: jest.fn(),
-    stop: jest.fn(),
-    stopChunk: jest.fn(),
-    startChunk: jest.fn(),
-  },
-  request: {},
-  clock: {
-    install: jest.fn(),
-    fastForward: jest.fn(),
-    pauseAt: jest.fn(),
-    resume: jest.fn(),
-    runFor: jest.fn(),
-    setFixedTime: jest.fn(),
-    setSystemTime: jest.fn(),
-  },
-  serviceWorkers: jest.fn().mockReturnValue([]),
-  backgroundPages: jest.fn().mockReturnValue([]),
-  _guid: 'mock-context',
-  _type: 'browserContext',
-} as unknown as BrowserContext;
+const createFingerprint = (
+  overrides: Record<
+    string,
+    unknown
+  > = {},
+): any => ({
+  id: 'test-fingerprint',
 
-const mockBrowser = {
-  newContext: jest.fn().mockResolvedValue(mockContext),
-  close: jest.fn().mockResolvedValue(undefined),
-  isConnected: jest.fn().mockReturnValue(true),
-};
-
-// Patchright mock
-jest.mock('patchright', () => ({
-  chromium: {
-    launch: jest.fn().mockResolvedValue(mockBrowser),
-  },
-}));
-
-// fs mock
-jest.mock('fs', () => ({
-  existsSync: jest.fn().mockReturnValue(false),
-  mkdirSync: jest.fn().mockReturnValue(undefined),
-  readFileSync: jest.fn().mockReturnValue('[]'),
-  writeFileSync: jest.fn().mockReturnValue(undefined),
-}));
-
-// path mock
-jest.mock('path', () => ({
-  join: jest.fn((...args: string[]) => args.join('/')),
-}));
-
-const mockLogger: jest.Mocked<Logger> = {
-  debug: jest.fn(),
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-} as unknown as jest.Mocked<Logger>;
-
-// Test data
-const mockFingerprint: FingerprintData = {
-  id: 'fp-test-123',
   type: 'desktop',
-  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  viewport: { width: 1920, height: 1080 },
-  screenResolution: { width: 1920, height: 1080 },
-  colorDepth: 24,
+
+  viewport: {
+    width: 1280,
+    height: 720,
+  },
+
+  userAgent:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+
+  language: 'en-US',
+
+  timezone:
+    'Europe/Istanbul',
+
   pixelRatio: 1,
-  timezone: 'Europe/Istanbul',
-  language: 'tr-TR',
-  languages: ['tr-TR', 'tr', 'en-US', 'en'],
-  platform: 'Win32',
-  cpuCores: 8,
-  memory: 16,
-  doNotTrack: null,
-  cookiesEnabled: true,
-  localStorage: true,
-  sessionStorage: true,
-  indexedDB: true,
-  webGL: {
-    vendor: 'Google Inc.',
-    renderer: 'ANGLE',
-    unmaskedVendor: 'NVIDIA',
-    unmaskedRenderer: 'NVIDIA GeForce GTX 1080',
-    aliasedLineWidthRange: [1, 1] as [number, number],
-    aliasedPointSizeRange: [1, 1024] as [number, number],
-    alphaBits: 8,
-    blueBits: 8,
-    depthBits: 24,
-    greenBits: 8,
-    redBits: 8,
-    maxCombinedTextureImageUnits: 32,
-    maxCubeMapTextureSize: 16384,
-    maxFragmentUniformVectors: 1024,
-    maxRenderbufferSize: 16384,
-    maxTextureImageUnits: 16,
-    maxTextureSize: 16384,
-    maxVaryingVectors: 30,
-    maxVertexAttribs: 16,
-    maxVertexTextureImageUnits: 16,
-    maxVertexUniformVectors: 4096,
-    precisionFormats: {},
-    extensions: [],
-  },
-  canvas: {
-    type: '2d',
-    width: 220,
-    height: 30,
-    data: 'data:image/png;base64,abc123',
-    noise: 0.05,
-    features: ['text', 'emoji'],
-  },
-  fonts: ['Arial', 'Helvetica'],
-  plugins: [],
-  mimeTypes: [],
-  pluginsLength: 0,
-  mimeTypesLength: 0,
-  webdriver: false,
-  chrome: true,
-  isMobile: false,
+
   touchSupport: false,
-  deviceMemory: 8,
-  hardwareConcurrency: 8,
-  maxTouchPoints: 0,
-  vendor: 'Google Inc.',
-  product: 'Gecko',
-  productSub: '20030107',
-  ja3Hash: 'abc123',
-  akamaiFingerprint: 'def456',
-  battery: undefined,
-  network: {
-    effectiveType: '4g',
-    downlink: 10,
-    rtt: 50,
-    saveData: false,
-  },
-  speechVoices: [],
-  speechSynthesisVoices: 0,
-  screen: {
-    width: 1920,
-    height: 1080,
-    availWidth: 1920,
-    availHeight: 1050,
-    availLeft: 0,
-    availTop: 0,
-    colorDepth: 24,
-    pixelDepth: 24,
-    orientation: {
-      angle: 0,
-      type: 'landscape-primary',
-    },
-  },
-  navigator: {} as any,
-  window: {} as any,
-  document: {} as any,
-  location: {} as any,
-  history: {} as any,
-  mediaCapabilities: {} as any,
-  touchSupportInfo: {} as any,
-  keyboard: {} as any,
-  pointer: {} as any,
-  gamepad: {} as any,
-  vr: {} as any,
-  mediaSession: {} as any,
-  wakeLock: undefined,
-  deviceOrientation: undefined,
-  deviceMotion: undefined,
-  proximity: undefined,
-  ambientLight: undefined,
-  connection: {
-    effectiveType: '4g',
-    downlink: 10,
-    downlinkMax: 100,
-    rtt: 50,
-    saveData: false,
-    type: 'wifi',
-  },
-  credentials: {} as any,
-  permissions: {} as any,
-  payment: {} as any,
-  webShare: {} as any,
-  contacts: undefined,
-  clipboard: {} as any,
-  mediaDevices: {} as any,
-  pdfViewerEnabled: true,
-};
 
-const mockProxy: ProxyStatus = {
-  url: 'http://user:pass@proxy.example.com:8080',
-  isActive: true,
-  lastUsed: new Date(),
-  failCount: 0,
-  successCount: 10,
-  averageResponseTime: 150,
-  isBanned: false,
-  provider: 'TestProxy',
-};
-
-describe('BrowserManager (Patchright)', () => {
-  let browserManager: BrowserManager;
-
-  beforeEach(() => {
-    // Reset singleton
-    resetBrowserManager();
-    
-    // Reset mocks
-    jest.clearAllMocks();
-    
-    // Create fresh instance
-    browserManager = new BrowserManager({}, mockLogger);
-  });
-
-  afterEach(async () => {
-    await resetBrowserManager();
-    await closeAllBrowserManagers();
-    jest.clearAllMocks();
-  });
-
-  // ---------------------------------------------------------------
-  describe('Browser Launch', () => {
-    test('Patchright ile browser başlatılmalı', async () => {
-      const { chromium } = jest.requireMock('patchright');
-      
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(chromium.launch).toHaveBeenCalled();
-      expect(mockBrowser.newContext).toHaveBeenCalled();
-      expect(context).toBe(mockContext);
-      
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Launching browser'),
-        expect.any(Object)
-      );
-    });
-
-    test('Proxy konfigürasyonu doğru ayarlanmalı', async () => {
-      const { chromium } = jest.requireMock('patchright');
-      
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const launchCall = chromium.launch.mock.calls[0][0];
-      expect(launchCall.proxy.server).toContain('proxy.example.com:8080');
-      expect(launchCall.proxy.username).toBe('user');
-      expect(launchCall.proxy.password).toBe('pass');
-    });
-
-    test('Stealth args eklenmeli', async () => {
-      const { chromium } = jest.requireMock('patchright');
-      
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const launchCall = chromium.launch.mock.calls[0][0];
-      expect(launchCall.args).toContain('--disable-blink-features=AutomationControlled');
-      expect(launchCall.args).toContain('--no-sandbox');
-      expect(launchCall.args).toContain('--disable-setuid-sandbox');
-    });
-
-    test('Context viewport ve userAgent ayarlanmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const contextCall = mockBrowser.newContext.mock.calls[0][0];
-      expect(contextCall.viewport.width).toBe(1920);
-      expect(contextCall.viewport.height).toBe(1080);
-      expect(contextCall.userAgent).toBe(mockFingerprint.userAgent);
-      expect(contextCall.locale).toBe('tr-TR');
-    });
-
-    test('Mobile fingerprint için isMobile true olmalı', async () => {
-      const mobileFingerprint = { ...mockFingerprint, type: 'mobile' as const, isMobile: true, touchSupport: true };
-      
-      await browserManager.launchBrowser(mobileFingerprint, mockProxy);
-      
-      const contextCall = mockBrowser.newContext.mock.calls[0][0];
-      expect(contextCall.isMobile).toBe(true);
-      expect(contextCall.hasTouch).toBe(true);
-    });
-
-    test('Cookie yüklenebilmeli', async () => {
-      const cookies = [{ name: 'session', value: 'abc123', domain: 'google.com' }];
-      
-      await browserManager.launchBrowser(mockFingerprint, mockProxy, cookies);
-      
-      expect(mockContext.addCookies).toHaveBeenCalledWith(cookies);
-    });
-
-    test('Max concurrent limit aşılırsa bekleme yapılmalı', async () => {
-      browserManager = new BrowserManager({ maxConcurrentBrowsers: 1 }, mockLogger);
-      
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      // İkinci browser için bekleme başlatılacak
-      const launchPromise = browserManager.launchBrowser(
-        { ...mockFingerprint, id: 'fp-2' },
-        mockProxy
-      );
-      
-      // İlkini kapat
-      await browserManager.closeBrowser(mockContext);
-      
-      await launchPromise;
-      
-      expect(mockLogger.warn).toHaveBeenCalledWith('Max concurrent browsers reached, waiting...');
-    });
-
-    test('Launch hatası loglanmalı', async () => {
-      const { chromium } = jest.requireMock('patchright');
-      chromium.launch.mockRejectedValueOnce(new Error('Launch failed'));
-      
-      await expect(
-        browserManager.launchBrowser(mockFingerprint, mockProxy)
-      ).rejects.toThrow('Launch failed');
-      
-      expect(mockLogger.error).toHaveBeenCalled();
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('CDP Integration', () => {
-    test('CDP session oluşturulmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockPage.context().newCDPSession).toHaveBeenCalled();
-    });
-
-    test('WebRTC devre dışı bırakılmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockCDPSession.send).toHaveBeenCalledWith('WebRTC.disable');
-    });
-
-    test('Network throttling ayarlanmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const networkCall = mockCDPSession.send.mock.calls.find(
-        call => call[0] === 'Network.emulateNetworkConditions'
-      );
-      
-      expect(networkCall).toBeDefined();
-      expect(networkCall[1]).toMatchObject({
-        offline: false,
-        latency: 50,
-      });
-    });
-
-    test('Mobile için device metrics override yapılmalı', async () => {
-      const mobileFingerprint = { ...mockFingerprint, type: 'mobile' as const, isMobile: true };
-      
-      await browserManager.launchBrowser(mobileFingerprint, mockProxy);
-      
-      expect(mockCDPSession.send).toHaveBeenCalledWith(
-        'Emulation.setDeviceMetricsOverride',
-        expect.any(Object)
-      );
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Resource Interceptor', () => {
-    test('Route handler kurulmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.route).toHaveBeenCalledWith('**/*', expect.any(Function));
-    });
-
-    test('WebRTC istekleri engellenmeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const routeHandler = mockContext.route.mock.calls[0][1];
-      const mockRoute = {
-        request: jest.fn().mockReturnValue({ url: () => 'https://example.com/webrtc', resourceType: () => 'xhr' }),
-        abort: jest.fn(),
-        continue: jest.fn(),
-      };
-      
-      await routeHandler(mockRoute);
-      
-      expect(mockRoute.abort).toHaveBeenCalled();
-    });
-
-    test('Analytics istekleri engellenmeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const routeHandler = mockContext.route.mock.calls[0][1];
-      const mockRoute = {
-        request: jest.fn().mockReturnValue({ 
-          url: () => 'https://google-analytics.com/collect', 
-          resourceType: () => 'xhr' 
-        }),
-        abort: jest.fn(),
-        continue: jest.fn(),
-      };
-      
-      await routeHandler(mockRoute);
-      
-      expect(mockRoute.abort).toHaveBeenCalled();
-    });
-
-    test('Normal istekler devam etmeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const routeHandler = mockContext.route.mock.calls[0][1];
-      const mockRoute = {
-        request: jest.fn().mockReturnValue({ 
-          url: () => 'https://google.com', 
-          resourceType: () => 'document' 
-        }),
-        abort: jest.fn(),
-        continue: jest.fn(),
-      };
-      
-      await routeHandler(mockRoute);
-      
-      expect(mockRoute.continue).toHaveBeenCalled();
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Lifecycle Manager', () => {
-    test('Crash event handler kurulmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.on).toHaveBeenCalledWith('crashed', expect.any(Function));
-    });
-
-    test('Dialog handler kurulmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.on).toHaveBeenCalledWith('dialog', expect.any(Function));
-    });
-
-    test('Page error handler kurulmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.on).toHaveBeenCalledWith('pageerror', expect.any(Function));
-    });
-
-    test('Dialog otomatik dismiss edilmeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const dialogHandler = mockContext.on.mock.calls.find(
-        (call: [string, ...any[]]) => call[0] === 'dialog'
-      )[1];
-      
-      const mockDialog = {
-        type: jest.fn().mockReturnValue('alert'),
-        dismiss: jest.fn().mockResolvedValue(undefined),
-      };
-      
-      await dialogHandler(mockDialog);
-      
-      expect(mockDialog.dismiss).toHaveBeenCalled();
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Stealth Scripts', () => {
-    test('Stealth scripts uygulanmalı', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.addInitScript).toHaveBeenCalled();
-      const scriptCall = mockContext.addInitScript.mock.calls[0][0];
-      expect(scriptCall).toContain('webdriver');
-      expect(scriptCall).toContain('chrome');
-      expect(scriptCall).toContain('plugins');
-    });
-
-    test('Canvas noise injection içermeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const scriptCall = mockContext.addInitScript.mock.calls[0][0];
-      expect(scriptCall).toContain('getImageData');
-      expect(scriptCall).toContain('noise');
-    });
-
-    test('WebGL spoofing içermeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const scriptCall = mockContext.addInitScript.mock.calls[0][0];
-      expect(scriptCall).toContain('WebGLRenderingContext');
-      expect(scriptCall).toContain('37445'); // VENDOR parameter
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Page Creation', () => {
-    test('Yeni page oluşturulabilmeli', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      const page = await browserManager.createPage(context);
-      
-      expect(mockContext.newPage).toHaveBeenCalled();
-      expect(page).toBe(mockPage);
-    });
-
-    test('Bot detection kontrolü yapılmalı', async () => {
-      mockPage.evaluate.mockResolvedValueOnce(['webdriver']);
-      
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      await browserManager.createPage(context);
-      
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        'Bot detection triggered, applying additional stealth...'
-      );
-    });
-
-    test('Timeout ayarlanmalı', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      await browserManager.createPage(context);
-      
-      expect(mockPage.setDefaultTimeout).toHaveBeenCalled();
-      expect(mockPage.setDefaultNavigationTimeout).toHaveBeenCalled();
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Cookie Management', () => {
-    test('Cookie kaydedilebilmeli', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      const cookies = [{ name: 'test', value: 'value', domain: 'google.com' }];
-      mockContext.cookies.mockResolvedValueOnce(cookies);
-      
-      await browserManager.closeBrowser(context, true);
-      
-      const writeFileMock = jest.requireMock('fs').writeFileSync;
-      expect(writeFileMock).toHaveBeenCalled();
-    });
-
-    test('Cookie yüklenebilmeli', () => {
-      const cookiesData = JSON.stringify([{ name: 'loaded', value: 'cookie' }]);
-      jest.requireMock('fs').existsSync.mockReturnValueOnce(true);
-      jest.requireMock('fs').readFileSync.mockReturnValueOnce(cookiesData);
-      
-      const cookies = browserManager.loadCookies('fp-test-123');
-      
-      expect(cookies).toEqual([{ name: 'loaded', value: 'cookie' }]);
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Browser Close', () => {
-    test('Browser kapatılabilmeli', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      await browserManager.closeBrowser(context, true);
-      
-      expect(mockContext.close).toHaveBeenCalled();
-      expect(mockBrowser.close).toHaveBeenCalled();
-      expect(browserManager.getActiveBrowserCount()).toBe(0);
-    });
-
-    test('CDP session detach edilmeli', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      await browserManager.closeBrowser(context, false);
-      
-      expect(mockCDPSession.detach).toHaveBeenCalled();
-    });
-
-    test('Tüm browser\'lar kapatılabilmeli', async () => {
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      await browserManager.launchBrowser(
-        { ...mockFingerprint, id: 'fp-2' },
-        mockProxy
-      );
-      
-      expect(browserManager.getActiveBrowserCount()).toBe(2);
-      
-      await browserManager.closeAll();
-      
-      expect(browserManager.getActiveBrowserCount()).toBe(0);
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Stats and Getters', () => {
-    test('Aktif browser sayısı döndürülmeli', async () => {
-      expect(browserManager.getActiveBrowserCount()).toBe(0);
-      
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      expect(browserManager.getActiveBrowserCount()).toBe(1);
-    });
-
-    test('Detaylı istatistikler döndürülmeli', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      await browserManager.createPage(context);
-      
-      const stats = browserManager.getStats();
-      
-      expect(stats.active).toBe(1);
-      expect(stats.maxAllowed).toBe(5);
-      expect(stats.totalPages).toBe(1);
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Factory Pattern', () => {
-    test('createBrowserManager isimli instance oluşturmalı', () => {
-      const manager = createBrowserManager('test-instance', {}, mockLogger);
-      
-      expect(getNamedBrowserManager('test-instance')).toBe(manager);
-    });
-
-    test('Aynı isimle tekrar oluşturulunca eski kapatılmalı', () => {
-      const first = createBrowserManager('test', {}, mockLogger);
-      const closeSpy = jest.spyOn(first, 'closeAll');
-      
-      const second = createBrowserManager('test', {}, mockLogger);
-      
-      expect(closeSpy).toHaveBeenCalled();
-      expect(getNamedBrowserManager('test')).toBe(second);
-    });
-
-    test('closeNamedBrowserManager instance kapatıp silmeli', () => {
-      const manager = createBrowserManager('close-test', {}, mockLogger);
-      const closeSpy = jest.spyOn(manager, 'closeAll');
-      
-      closeNamedBrowserManager('close-test');
-      
-      expect(closeSpy).toHaveBeenCalled();
-      expect(getNamedBrowserManager('close-test')).toBeUndefined();
-    });
-
-    test('closeAllBrowserManagers hepsini kapatmalı', () => {
-      const a = createBrowserManager('a', {}, mockLogger);
-      const b = createBrowserManager('b', {}, mockLogger);
-      const spyA = jest.spyOn(a, 'closeAll');
-      const spyB = jest.spyOn(b, 'closeAll');
-      
-      closeAllBrowserManagers();
-      
-      expect(spyA).toHaveBeenCalled();
-      expect(spyB).toHaveBeenCalled();
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Configuration', () => {
-    test('Resource interceptor config uygulanmalı', async () => {
-      const config: Partial<BrowserManagerConfig> = {
-        resourceInterceptor: {
-          blockImages: true,
-          blockFonts: true,
-          blockCSS: false,
-        },
-      };
-      
-      browserManager = new BrowserManager(config, mockLogger);
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.route).toHaveBeenCalled();
-    });
-
-    test('Lifecycle config uygulanmalı', async () => {
-      const config: Partial<BrowserManagerConfig> = {
-        lifecycle: {
-          navigationTimeout: 45000,
-          crashRecovery: true,
-          maxRecoveryAttempts: 5,
-        },
-      };
-      
-      browserManager = new BrowserManager(config, mockLogger);
-      await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      
-      expect(mockContext.on).toHaveBeenCalledWith('crashed', expect.any(Function));
-    });
-  });
-
-  // ---------------------------------------------------------------
-  describe('Screenshot', () => {
-    test('Debug modda screenshot alınabilmeli', async () => {
-      browserManager = new BrowserManager({ debugMode: true }, mockLogger);
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      const page = await browserManager.createPage(context);
-      
-      await browserManager.takeScreenshot(page, 'test-screenshot');
-      
-      expect(mockPage.screenshot).toHaveBeenCalledWith({
-        path: expect.stringContaining('test-screenshot'),
-        fullPage: true,
-      });
-    });
-
-    test('Debug mod kapalıysa screenshot alınmamalı', async () => {
-      browserManager = new BrowserManager({ debugMode: false }, mockLogger);
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      const page = await browserManager.createPage(context);
-      
-      await browserManager.takeScreenshot(page, 'test-screenshot');
-      
-      expect(mockPage.screenshot).not.toHaveBeenCalled();
-    });
-  });
+  ...overrides,
 });
+
+const createProxy = (
+  url =
+    'http://user:password@127.0.0.1:8080',
+): any => ({
+  url,
+});
+
+/* =========================================================
+ * TEST SUITE
+ * ======================================================= */
+
+describe(
+  'BrowserManager',
+  () => {
+    let tempDirectory: string;
+    let cookieDirectory: string;
+    let browserDataDirectory: string;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+
+      tempDirectory =
+        mkdtempSync(
+          join(
+            tmpdir(),
+            'browser-manager-test-',
+          ),
+        );
+
+      cookieDirectory =
+        join(
+          tempDirectory,
+          'cookies',
+        );
+
+      browserDataDirectory =
+        join(
+          tempDirectory,
+          'browser-data',
+        );
+    });
+
+    afterEach(
+      async () => {
+        await resetBrowserManager();
+
+        await closeAllBrowserManagers();
+
+        rmSync(
+          tempDirectory,
+          {
+            recursive: true,
+            force: true,
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * CONSTRUCTOR
+     * =================================================== */
+
+    describe(
+      'constructor',
+      () => {
+        it(
+          'should create required directories',
+          () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            expect(
+              manager,
+            ).toBeInstanceOf(
+              BrowserManager,
+            );
+
+            expect(
+              existsSync(
+                cookieDirectory,
+              ),
+            ).toBe(true);
+
+            expect(
+              existsSync(
+                browserDataDirectory,
+              ),
+            ).toBe(true);
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * LAUNCH
+     * =================================================== */
+
+    describe(
+      'launchBrowser',
+      () => {
+        it(
+          'should launch browser and create context',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            expect(
+              context,
+            ).toBe(mockContext);
+
+            expect(
+              chromium.launch,
+            ).toHaveBeenCalledTimes(
+              1,
+            );
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(1);
+
+            expect(
+              context.route,
+            ).toHaveBeenCalledTimes(
+              1,
+            );
+          },
+        );
+
+        it(
+          'should pass proxy credentials correctly',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(
+                'http://test-user:test-pass@proxy.example.com:3128',
+              ),
+            );
+
+            const launchMock =
+              chromium.launch as jest.Mock;
+
+            const options =
+              launchMock.mock.calls[0][0];
+
+            expect(
+              options.proxy,
+            ).toEqual({
+              server:
+                'http://proxy.example.com:3128',
+
+              username:
+                'test-user',
+
+              password:
+                'test-pass',
+            });
+          },
+        );
+
+        it(
+          'should pass configured launch args',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                launchArgs: [
+                  '--disable-dev-shm-usage',
+                  '--custom-test-arg',
+                ],
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const launchMock =
+              chromium.launch as jest.Mock;
+
+            const options =
+              launchMock.mock.calls[0][0];
+
+            expect(
+              options.args,
+            ).toEqual([
+              '--disable-dev-shm-usage',
+              '--custom-test-arg',
+            ]);
+          },
+        );
+
+        it(
+          'should apply fingerprint context settings',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const fingerprint =
+              createFingerprint({
+                viewport: {
+                  width: 1440,
+                  height: 900,
+                },
+
+                userAgent:
+                  'Test-Agent/1.0',
+
+                language:
+                  'tr-TR',
+
+                timezone:
+                  'Europe/Istanbul',
+
+                pixelRatio: 2,
+
+                touchSupport:
+                  true,
+
+                type: 'mobile',
+              });
+
+            await manager.launchBrowser(
+              fingerprint,
+              createProxy(),
+            );
+
+            const browser =
+              (
+                chromium.launch as
+                  jest.Mock
+              ).mock.results[0]
+                .value;
+
+            const resolvedBrowser =
+              await browser;
+
+            const contextOptions =
+              resolvedBrowser
+                .newContext.mock
+                .calls[0][0];
+
+            expect(
+              contextOptions.viewport,
+            ).toEqual({
+              width: 1440,
+              height: 900,
+            });
+
+            expect(
+              contextOptions.userAgent,
+            ).toBe(
+              'Test-Agent/1.0',
+            );
+
+            expect(
+              contextOptions.locale,
+            ).toBe('tr-TR');
+
+            expect(
+              contextOptions.timezoneId,
+            ).toBe(
+              'Europe/Istanbul',
+            );
+
+            expect(
+              contextOptions
+                .deviceScaleFactor,
+            ).toBe(2);
+
+            expect(
+              contextOptions.isMobile,
+            ).toBe(true);
+
+            expect(
+              contextOptions.hasTouch,
+            ).toBe(true);
+          },
+        );
+
+        it(
+          'should create initial page',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            expect(
+              context.newPage,
+            ).toHaveBeenCalled();
+
+            const page =
+              mockPages[0];
+
+            expect(
+              page.goto,
+            ).toHaveBeenCalledWith(
+              'about:blank',
+            );
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * INVALID PROXY
+     * =================================================== */
+
+    describe(
+      'proxy validation',
+      () => {
+        it(
+          'should reject unsupported proxy protocol',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            await expect(
+              manager.launchBrowser(
+                createFingerprint(),
+                createProxy(
+                  'ftp://proxy.example.com:21',
+                ),
+              ),
+            ).rejects.toThrow(
+              'Unsupported proxy protocol',
+            );
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(0);
+          },
+        );
+
+        it(
+          'should reject invalid proxy URL',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            await expect(
+              manager.launchBrowser(
+                createFingerprint(),
+                createProxy(
+                  'not-a-valid-url',
+                ),
+              ),
+            ).rejects.toThrow();
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(0);
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * PAGE
+     * =================================================== */
+
+    describe(
+      'createPage',
+      () => {
+        it(
+          'should create a page and apply timeout configuration',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                lifecycle: {
+                  defaultTimeout:
+                    15_000,
+
+                  navigationTimeout:
+                    25_000,
+                },
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            const page =
+              await manager.createPage(
+                context,
+              );
+
+            expect(
+              page.setDefaultTimeout,
+            ).toHaveBeenCalledWith(
+              15_000,
+            );
+
+            expect(
+              page.setDefaultNavigationTimeout,
+            ).toHaveBeenCalledWith(
+              25_000,
+            );
+          },
+        );
+
+        it(
+          'should reject unmanaged context',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const foreignContext =
+              createMockContext();
+
+            await expect(
+              manager.createPage(
+                foreignContext as any,
+              ),
+            ).rejects.toThrow(
+              'BrowserContext is not managed by this BrowserManager.',
+            );
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * COOKIES
+     * =================================================== */
+
+    describe(
+      'cookies',
+      () => {
+        it(
+          'should restore supplied cookies',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const cookies: any[] = [
+              {
+                name: 'session',
+                value: 'abc123',
+                domain:
+                  'example.com',
+                path: '/',
+              },
+            ];
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+              cookies,
+            );
+
+            expect(
+              mockContext.addCookies,
+            ).toHaveBeenCalledWith(
+              cookies,
+            );
+          },
+        );
+
+        it(
+          'should load cookies from disk when no cookies are supplied',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const fingerprintId =
+              'disk-cookie-fingerprint';
+
+            const fingerprint =
+              createFingerprint({
+                id: fingerprintId,
+              });
+
+            const cookies: any[] = [
+              {
+                name: 'persisted',
+                value: 'yes',
+                domain:
+                  'example.com',
+                path: '/',
+              },
+            ];
+
+            const cookieFile =
+              join(
+                cookieDirectory,
+                `${fingerprintId}.json`,
+              );
+
+            mkdirSync(
+              cookieDirectory,
+              {
+                recursive: true,
+              },
+            );
+
+            writeFileSync(
+              cookieFile,
+              JSON.stringify(
+                cookies,
+              ),
+              'utf8',
+            );
+
+            await manager.launchBrowser(
+              fingerprint,
+              createProxy(),
+            );
+
+            expect(
+              mockContext.addCookies,
+            ).toHaveBeenCalledWith(
+              cookies,
+            );
+          },
+        );
+
+        it(
+          'should save cookies when browser closes',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const fingerprintId =
+              'save-cookie-test';
+
+            const fingerprint =
+              createFingerprint({
+                id: fingerprintId,
+              });
+
+            const cookies: any[] = [
+              {
+                name: 'session',
+                value:
+                  'saved-value',
+                domain:
+                  'example.com',
+                path: '/',
+              },
+            ];
+
+            const context =
+              await manager.launchBrowser(
+                fingerprint,
+                createProxy(),
+              );
+
+            /*
+             * ÖNEMLİ:
+             *
+             * mockContext launchBrowser() sırasında
+             * oluşturulduğu için cookies mock'u
+             * launchBrowser() sonrasında ayarlanıyor.
+             */
+            mockContext.cookies =
+              jest
+                .fn()
+                .mockResolvedValue(
+                  cookies,
+                );
+
+            await manager.closeBrowser(
+              context,
+              true,
+            );
+
+            const cookieFile =
+              join(
+                cookieDirectory,
+                `${fingerprintId}.json`,
+              );
+
+            expect(
+              existsSync(
+                cookieFile,
+              ),
+            ).toBe(true);
+
+            const stored =
+              JSON.parse(
+                readFileSync(
+                  cookieFile,
+                  'utf8',
+                ),
+              );
+
+            expect(
+              stored,
+            ).toEqual(
+              cookies,
+            );
+          },
+        );
+
+        it(
+          'should not save cookies when disabled',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const fingerprintId =
+              'no-save-cookie';
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint({
+                  id: fingerprintId,
+                }),
+                createProxy(),
+              );
+
+            await manager.closeBrowser(
+              context,
+              false,
+            );
+
+            expect(
+              mockContext.cookies,
+            ).not.toHaveBeenCalled();
+
+            const cookieFile =
+              join(
+                cookieDirectory,
+                `${fingerprintId}.json`,
+              );
+
+            expect(
+              existsSync(
+                cookieFile,
+              ),
+            ).toBe(false);
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * RESOURCE INTERCEPTION
+     * =================================================== */
+
+    describe(
+      'resource interceptor',
+      () => {
+        it(
+          'should block images',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockImages: true,
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            expect(
+              mockContext.__routeHandler,
+            ).toBeDefined();
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://example.com/test.png',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () =>
+                      'image',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.abort,
+            ).toHaveBeenCalled();
+
+            expect(
+              route.continue,
+            ).not.toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should allow CSS by default',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://example.com/app.css',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () =>
+                      'stylesheet',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.continue,
+            ).toHaveBeenCalled();
+
+            expect(
+              route.abort,
+            ).not.toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should block CSS when enabled',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockCSS: true,
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://example.com/app.css',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () =>
+                      'stylesheet',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.abort,
+            ).toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should block fonts',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockFonts: true,
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://cdn.example.com/font.woff2',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () => 'font',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.abort,
+            ).toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should block media',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockMedia: true,
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://example.com/video.mp4',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () => 'media',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.abort,
+            ).toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should allow about URLs',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'about:blank',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () => 'document',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.continue,
+            ).toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should allow configured domains',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockImages:
+                    true,
+
+                  allowedDomains: [
+                    'example.com',
+                  ],
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://cdn.example.com/image.png',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () => 'image',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.continue,
+            ).toHaveBeenCalled();
+
+            expect(
+              route.abort,
+            ).not.toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should block tracking hosts when enabled',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockTracking:
+                    true,
+
+                  trackingHosts: [
+                    'google-analytics.com',
+                  ],
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://www.google-analytics.com/collect',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () => 'script',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.abort,
+            ).toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should allow tracking hosts when blocking is disabled',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                resourceInterceptor: {
+                  blockTracking:
+                    false,
+
+                  trackingHosts: [
+                    'google-analytics.com',
+                  ],
+                },
+              });
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            const route: MockRoute = {
+              continue: jest.fn(),
+              abort: jest.fn(),
+            };
+
+            const request: MockRequest =
+              {
+                url: jest.fn(
+                  () =>
+                    'https://www.google-analytics.com/collect',
+                ),
+
+                resourceType:
+                  jest.fn(
+                    () => 'script',
+                  ),
+              };
+
+            await mockContext
+              .__routeHandler!(
+                route,
+                request,
+              );
+
+            expect(
+              route.continue,
+            ).toHaveBeenCalled();
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * STATS
+     * =================================================== */
+
+    describe(
+      'statistics',
+      () => {
+        it(
+          'should report active browser and page counts',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            await manager.createPage(
+              context,
+            );
+
+            const stats =
+              manager.getStats();
+
+            expect(
+              stats.active,
+            ).toBe(1);
+
+            expect(
+              stats.maxAllowed,
+            ).toBe(5);
+
+            expect(
+              stats.totalPagesCreated,
+            ).toBeGreaterThanOrEqual(
+              2,
+            );
+
+            expect(
+              stats.activePages,
+            ).toBeGreaterThanOrEqual(
+              2,
+            );
+
+            expect(
+              stats.oldestBrowser,
+            ).toBeInstanceOf(
+              Date,
+            );
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * SCREENSHOT
+     * =================================================== */
+
+    describe(
+      'screenshot',
+      () => {
+        it(
+          'should not screenshot when debug mode is disabled',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                debugMode: false,
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            const page =
+              await manager.createPage(
+                context,
+              );
+
+            await manager.takeScreenshot(
+              page,
+              'test screenshot',
+            );
+
+            expect(
+              page.screenshot,
+            ).not.toHaveBeenCalled();
+          },
+        );
+
+        it(
+          'should take screenshot when debug mode is enabled',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+
+                debugMode: true,
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            const page =
+              await manager.createPage(
+                context,
+              );
+
+            await manager.takeScreenshot(
+              page,
+              'test screenshot',
+            );
+
+            expect(
+              page.screenshot,
+            ).toHaveBeenCalledTimes(
+              1,
+            );
+
+            const screenshotOptions =
+              page.screenshot.mock
+                .calls[0][0];
+
+            expect(
+              screenshotOptions.fullPage,
+            ).toBe(true);
+
+            expect(
+              screenshotOptions.path,
+            ).toContain(
+              'test_screenshot.png',
+            );
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * CLOSE
+     * =================================================== */
+
+    describe(
+      'closeBrowser',
+      () => {
+        it(
+          'should close context and browser',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const context =
+              await manager.launchBrowser(
+                createFingerprint(),
+                createProxy(),
+              );
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(1);
+
+            await manager.closeBrowser(
+              context,
+              false,
+            );
+
+            expect(
+              mockContext.close,
+            ).toHaveBeenCalled();
+
+            expect(
+              mockBrowser.close,
+            ).toHaveBeenCalled();
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(0);
+          },
+        );
+
+        it(
+          'should safely close unmanaged context',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const foreignContext =
+              createMockContext();
+
+            await manager.closeBrowser(
+              foreignContext as any,
+              false,
+            );
+
+            expect(
+              foreignContext.close,
+            ).toHaveBeenCalled();
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * CONCURRENCY
+     * =================================================== */
+
+    describe(
+      'concurrency',
+      () => {
+        it(
+          'should respect maxConcurrentBrowsers',
+          async () => {
+            const manager =
+              new BrowserManager({
+                maxConcurrentBrowsers:
+                  1,
+
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const first =
+              await manager.launchBrowser(
+                createFingerprint({
+                  id: 'first',
+                }),
+                createProxy(),
+              );
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(1);
+
+            let secondResolved =
+              false;
+
+            const secondPromise =
+              manager
+                .launchBrowser(
+                  createFingerprint({
+                    id: 'second',
+                  }),
+                  createProxy(),
+                )
+                .then(context => {
+                  secondResolved =
+                    true;
+
+                  return context;
+                });
+
+            /*
+             * İkinci launch slot beklemeli.
+             */
+            await new Promise(
+              resolve =>
+                setTimeout(
+                  resolve,
+                  20,
+                ),
+            );
+
+            expect(
+              secondResolved,
+            ).toBe(false);
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(1);
+
+            await manager.closeBrowser(
+              first,
+              false,
+            );
+
+            const second =
+              await secondPromise;
+
+            expect(
+              second,
+            ).toBeDefined();
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(1);
+
+            await manager.closeBrowser(
+              second,
+              false,
+            );
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(0);
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * FACTORY
+     * =================================================== */
+
+    describe(
+      'factory',
+      () => {
+        it(
+          'should create and retrieve named manager',
+          () => {
+            const manager =
+              createBrowserManager(
+                'test-manager',
+                {
+                  cookieDir:
+                    cookieDirectory,
+
+                  userDataDir:
+                    browserDataDirectory,
+                },
+              );
+
+            expect(
+              getNamedBrowserManager(
+                'test-manager',
+              ),
+            ).toBe(manager);
+          },
+        );
+
+        it(
+          'should reject duplicate manager names',
+          () => {
+            createBrowserManager(
+              'duplicate',
+              {
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              },
+            );
+
+            expect(() =>
+              createBrowserManager(
+                'duplicate',
+                {
+                  cookieDir:
+                    cookieDirectory,
+
+                  userDataDir:
+                    browserDataDirectory,
+                },
+              ),
+            ).toThrow(
+              'already exists',
+            );
+          },
+        );
+
+        it(
+          'should close named manager',
+          async () => {
+            const manager =
+              createBrowserManager(
+                'close-test',
+                {
+                  cookieDir:
+                    cookieDirectory,
+
+                  userDataDir:
+                    browserDataDirectory,
+                },
+              );
+
+            await manager.launchBrowser(
+              createFingerprint(),
+              createProxy(),
+            );
+
+            await closeNamedBrowserManager(
+              'close-test',
+            );
+
+            expect(
+              getNamedBrowserManager(
+                'close-test',
+              ),
+            ).toBeUndefined();
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * SINGLETON
+     * =================================================== */
+
+    describe(
+      'singleton',
+      () => {
+        it(
+          'should return same BrowserManager instance',
+          () => {
+            const first =
+              getBrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const second =
+              getBrowserManager();
+
+            expect(
+              second,
+            ).toBe(first);
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * CLEAN SHUTDOWN
+     * =================================================== */
+
+    describe(
+      'shutdown',
+      () => {
+        it(
+          'should close all active browsers',
+          async () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            const first =
+              await manager.launchBrowser(
+                createFingerprint({
+                  id: 'one',
+                }),
+                createProxy(),
+              );
+
+            const second =
+              await manager.launchBrowser(
+                createFingerprint({
+                  id: 'two',
+                }),
+                createProxy(),
+              );
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(2);
+
+            await manager.closeAll();
+
+            expect(
+              manager.getActiveBrowserCount(),
+            ).toBe(0);
+
+            expect(
+              first.close,
+            ).toBeDefined();
+
+            expect(
+              second.close,
+            ).toBeDefined();
+          },
+        );
+      },
+    );
+
+    /* =====================================================
+     * LOAD COOKIES
+     * =================================================== */
+
+    describe(
+      'loadCookies',
+      () => {
+        it(
+          'should return empty array for missing cookie file',
+          () => {
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            expect(
+              manager.loadCookies(
+                'does-not-exist',
+              ),
+            ).toEqual([]);
+          },
+        );
+
+        it(
+          'should return empty array for invalid JSON',
+          () => {
+            mkdirSync(
+              cookieDirectory,
+              {
+                recursive: true,
+              },
+            );
+
+            writeFileSync(
+              join(
+                cookieDirectory,
+                'invalid.json',
+              ),
+              '{invalid-json',
+              'utf8',
+            );
+
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            expect(
+              manager.loadCookies(
+                'invalid',
+              ),
+            ).toEqual([]);
+          },
+        );
+
+        it(
+          'should return empty array when JSON is not an array',
+          () => {
+            mkdirSync(
+              cookieDirectory,
+              {
+                recursive: true,
+              },
+            );
+
+            writeFileSync(
+              join(
+                cookieDirectory,
+                'object.json',
+              ),
+              JSON.stringify({
+                cookie: 'value',
+              }),
+              'utf8',
+            );
+
+            const manager =
+              new BrowserManager({
+                cookieDir:
+                  cookieDirectory,
+
+                userDataDir:
+                  browserDataDirectory,
+              });
+
+            expect(
+              manager.loadCookies(
+                'object',
+              ),
+            ).toEqual([]);
+          },
+        );
+      },
+    );
+  },
+);
