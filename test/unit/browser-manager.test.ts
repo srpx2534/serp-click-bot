@@ -11,7 +11,7 @@ import {
 } from '../../src/core/browser-manager';
 import { Logger } from '../../src/utils/logger';
 import { ProxyStatus } from '../../src/core/proxy-manager';
-import { BrowserFingerprint } from '../../src/types';
+import { FingerprintData } from '../../src/types';
 
 // Playwright mock
 const mockPage = {
@@ -60,26 +60,132 @@ describe('BrowserManager', () => {
   let browserManager: BrowserManager;
   let mockLogger: jest.Mocked<Logger>;
 
-  // Test data - BrowserFingerprint kullan (FingerprintData değil)
-  const mockFingerprint: BrowserFingerprint = {
+  // Test data - FingerprintData kullan
+  const mockFingerprint: FingerprintData = {
     id: 'fp-test-123',
     type: 'desktop',
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     viewport: { width: 1920, height: 1080 },
-    deviceMemory: 8,
-    hardwareConcurrency: 8,
-    platform: 'Win32',
-    language: 'tr-TR',
+    screenResolution: { width: 1920, height: 1080 },
+    colorDepth: 24,
+    pixelRatio: 1,
     timezone: 'Europe/Istanbul',
-    webgl: {
+    language: 'tr-TR',
+    languages: ['tr-TR', 'tr', 'en-US', 'en'],
+    platform: 'Win32',
+    cpuCores: 8,
+    memory: 16,
+    doNotTrack: null,
+    cookiesEnabled: true,
+    localStorage: true,
+    sessionStorage: true,
+    indexedDB: true,
+    webGL: {
       vendor: 'Google Inc.',
       renderer: 'ANGLE',
+      unmaskedVendor: 'NVIDIA',
+      unmaskedRenderer: 'NVIDIA GeForce GTX 1080',
+      aliasedLineWidthRange: [1, 1] as [number, number],
+      aliasedPointSizeRange: [1, 1024] as [number, number],
+      alphaBits: 8,
+      blueBits: 8,
+      depthBits: 24,
+      greenBits: 8,
+      redBits: 8,
+      maxCombinedTextureImageUnits: 32,
+      maxCubeMapTextureSize: 16384,
+      maxFragmentUniformVectors: 1024,
+      maxRenderbufferSize: 16384,
+      maxTextureImageUnits: 16,
+      maxTextureSize: 16384,
+      maxVaryingVectors: 30,
+      maxVertexAttribs: 16,
+      maxVertexTextureImageUnits: 16,
+      maxVertexUniformVectors: 4096,
+      precisionFormats: {},
+      extensions: [],
     },
-    // canvas string olmalı (CanvasRender değil)
-    canvas: 'data:image/png;base64,abc123',
-    audio: 'audio-fingerprint-123',
-    fonts: ['Arial', 'Helvetica', 'Times New Roman'],
-    createdAt: new Date().toISOString(),
+    canvas: {
+      type: '2d',
+      width: 220,
+      height: 30,
+      data: 'data:image/png;base64,abc123',
+      noise: 0.05,
+      features: ['text', 'emoji'],
+    },
+    fonts: ['Arial', 'Helvetica'],
+    plugins: [],
+    mimeTypes: [],
+    pluginsLength: 0,
+    mimeTypesLength: 0,
+    webdriver: false,
+    chrome: true,
+    isMobile: false,
+    touchSupport: false,
+    deviceMemory: 8,
+    hardwareConcurrency: 8,
+    maxTouchPoints: 0,
+    vendor: 'Google Inc.',
+    product: 'Gecko',
+    productSub: '20030107',
+    ja3Hash: 'abc123',
+    akamaiFingerprint: 'def456',
+    battery: undefined,
+    network: {
+      effectiveType: '4g',
+      downlink: 10,
+      rtt: 50,
+      saveData: false,
+    },
+    speechVoices: [],
+    speechSynthesisVoices: 0,
+    screen: {
+      width: 1920,
+      height: 1080,
+      availWidth: 1920,
+      availHeight: 1050,
+      availLeft: 0,
+      availTop: 0,
+      colorDepth: 24,
+      pixelDepth: 24,
+      orientation: {
+        angle: 0,
+        type: 'landscape-primary',
+      },
+    },
+    navigator: {} as any,
+    window: {} as any,
+    document: {} as any,
+    location: {} as any,
+    history: {} as any,
+    mediaCapabilities: {} as any,
+    touchSupportInfo: {} as any,
+    keyboard: {} as any,
+    pointer: {} as any,
+    gamepad: {} as any,
+    vr: {} as any,
+    mediaSession: {} as any,
+    wakeLock: undefined,
+    deviceOrientation: undefined,
+    deviceMotion: undefined,
+    proximity: undefined,
+    ambientLight: undefined,
+    connection: {
+      effectiveType: '4g',
+      downlink: 10,
+      downlinkMax: 100,
+      rtt: 50,
+      saveData: false,
+      type: 'wifi',
+    },
+    credentials: {} as any,
+    permissions: {} as any,
+    payment: {} as any,
+    webShare: {} as any,
+    contacts: undefined,
+    clipboard: {} as any,
+    mediaDevices: {} as any,
+    pdfViewerEnabled: true,
   };
 
   const mockProxy: ProxyStatus = {
@@ -198,7 +304,7 @@ describe('BrowserManager', () => {
       
       // Try to launch second (should wait)
       const launchPromise = limitedManager.launchBrowser(
-        { ...mockFingerprint, id: 'fp-2', createdAt: new Date().toISOString() },
+        { ...mockFingerprint, id: 'fp-2' },
         { ...mockProxy, url: 'http://proxy2:8080' }
       );
       
@@ -245,14 +351,14 @@ describe('BrowserManager', () => {
     });
 
     it('should apply mobile settings for mobile fingerprint', async () => {
-      const mobileFingerprint: BrowserFingerprint = {
+      const mobileFingerprint: FingerprintData = {
         ...mockFingerprint,
         id: 'fp-mobile-1',
         type: 'mobile',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X)',
+        isMobile: true,
+        touchSupport: true,
+        maxTouchPoints: 5,
         viewport: { width: 390, height: 844 },
-        platform: 'iPhone',
-        createdAt: new Date().toISOString(),
       };
       
       await browserManager.launchBrowser(mobileFingerprint, mockProxy);
@@ -334,7 +440,7 @@ describe('BrowserManager', () => {
       // Launch multiple browsers
       await browserManager.launchBrowser(mockFingerprint, mockProxy);
       await browserManager.launchBrowser(
-        { ...mockFingerprint, id: 'fp-2', createdAt: new Date().toISOString() },
+        { ...mockFingerprint, id: 'fp-2' },
         { ...mockProxy, url: 'http://proxy2:8080' }
       );
       
@@ -528,9 +634,9 @@ describe('BrowserManager', () => {
 
     it('should handle multiple concurrent launches', async () => {
       const promises = [
-        browserManager.launchBrowser({ ...mockFingerprint, id: 'fp-1', createdAt: new Date().toISOString() }, mockProxy),
-        browserManager.launchBrowser({ ...mockFingerprint, id: 'fp-2', createdAt: new Date().toISOString() }, mockProxy),
-        browserManager.launchBrowser({ ...mockFingerprint, id: 'fp-3', createdAt: new Date().toISOString() }, mockProxy),
+        browserManager.launchBrowser({ ...mockFingerprint, id: 'fp-1' }, mockProxy),
+        browserManager.launchBrowser({ ...mockFingerprint, id: 'fp-2' }, mockProxy),
+        browserManager.launchBrowser({ ...mockFingerprint, id: 'fp-3' }, mockProxy),
       ];
       
       const contexts = await Promise.all(promises);
