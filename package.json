@@ -1,0 +1,54 @@
+{
+  "name": "serp-click-bot",
+  "version": "1.0.0",
+  "description": "Advanced SERP click automation with stealth capabilities",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "clean": "rimraf dist",
+    "clean:logs": "rimraf data/logs/*",
+    "generate:fingerprints": "ts-node scripts/generate-fingerprints.ts",
+    "test:proxy": "ts-node scripts/test-proxy.ts"
+  },
+  "keywords": [
+    "serp",
+    "click-bot",
+    "automation",
+    "stealth",
+    "playwright",
+    "patchright",
+    "seo"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "dependencies": {
+    "date-fns": "^3.6.0",
+    "dotenv": "^16.4.5",
+    "fs": "^0.0.1-security",
+    "patchright": "^1.63.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.19.43",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "rimraf": "^5.0.7",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
