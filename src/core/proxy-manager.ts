@@ -293,7 +293,7 @@ export class ProxyManager {
 
     this.healthCheckTimer = setInterval(() => {
       this.performHealthCheck().catch(err =>
-        this.logger?.error('Health check crashed', { error: String(err) })
+        this.logger?.error('Health check crashed', null, { error: String(err) })
       );
     }, this.config.healthCheckInterval * 60 * 1000);
     this.healthCheckTimer.unref?.();
