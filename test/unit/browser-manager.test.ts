@@ -10,7 +10,8 @@ import {
   resetBrowserManager,
 } from '../../src/core/browser-manager';
 import { Logger } from '../../src/utils/logger';
-import { BrowserFingerprint, ProxyStatus } from '../../src/types';
+import { ProxyStatus } from '../../src/core/proxy-manager';
+import { FingerprintData } from '../../src/types';
 
 // Playwright mock
 const mockPage = {
@@ -27,7 +28,7 @@ const mockContext = {
   cookies: jest.fn().mockResolvedValue([{ name: 'test', value: 'value' }]),
   close: jest.fn().mockResolvedValue(undefined),
   addInitScript: jest.fn().mockResolvedValue(undefined),
-};
+} as any;
 
 const mockBrowser = {
   newContext: jest.fn().mockResolvedValue(mockContext),
@@ -57,10 +58,10 @@ jest.mock('path', () => ({
 
 describe('BrowserManager', () => {
   let browserManager: BrowserManager;
-  let mockLogger: Logger;
+  let mockLogger: jest.Mocked<Logger>;
 
-  // Test data
-  const mockFingerprint: BrowserFingerprint = {
+  // Test data - FingerprintData kullan (BrowserFingerprint değil)
+  const mockFingerprint: FingerprintData = {
     id: 'fp-test-123',
     type: 'desktop',
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -84,8 +85,8 @@ describe('BrowserManager', () => {
       renderer: 'ANGLE',
       unmaskedVendor: 'NVIDIA',
       unmaskedRenderer: 'NVIDIA GeForce GTX 1080',
-      aliasedLineWidthRange: [1, 1],
-      aliasedPointSizeRange: [1, 1024],
+      aliasedLineWidthRange: [1, 1] as [number, number],
+      aliasedPointSizeRange: [1, 1024] as [number, number],
       alphaBits: 8,
       blueBits: 8,
       depthBits: 24,
@@ -104,6 +105,7 @@ describe('BrowserManager', () => {
       precisionFormats: {},
       extensions: [],
     },
+    // CanvasRender tipinde olmalı
     canvas: {
       type: '2d',
       width: 220,
@@ -127,8 +129,6 @@ describe('BrowserManager', () => {
     vendor: 'Google Inc.',
     product: 'Gecko',
     productSub: '20030107',
-    tlsFingerprint: undefined,
-    http2Fingerprint: undefined,
     ja3Hash: 'abc123',
     akamaiFingerprint: 'def456',
     battery: undefined,
@@ -217,7 +217,7 @@ describe('BrowserManager', () => {
       logBotDetection: jest.fn(),
       logMetrics: jest.fn(),
       close: jest.fn(),
-    } as unknown as Logger;
+    } as unknown as jest.Mocked<Logger>;
 
     // Reset mocks
     jest.clearAllMocks();
@@ -352,9 +352,9 @@ describe('BrowserManager', () => {
     });
 
     it('should apply mobile settings for mobile fingerprint', async () => {
-      const mobileFingerprint = {
+      const mobileFingerprint: FingerprintData = {
         ...mockFingerprint,
-        type: 'mobile',
+        type: 'mobile' as const,
         isMobile: true,
         touchSupport: true,
         maxTouchPoints: 5,
@@ -438,8 +438,8 @@ describe('BrowserManager', () => {
   describe('closeAll', () => {
     it('should close all browsers', async () => {
       // Launch multiple browsers
-      const context1 = await browserManager.launchBrowser(mockFingerprint, mockProxy);
-      const context2 = await browserManager.launchBrowser(
+      await browserManager.launchBrowser(mockFingerprint, mockProxy);
+      await browserManager.launchBrowser(
         { ...mockFingerprint, id: 'fp-2' },
         { ...mockProxy, url: 'http://proxy2:8080' }
       );
@@ -538,7 +538,7 @@ describe('BrowserManager', () => {
   describe('Screenshot', () => {
     it('should take screenshot in debug mode', async () => {
       const debugManager = new BrowserManager({ debugMode: true }, mockLogger);
-      const context = await debugManager.launchBrowser(mockFingerprint, mockProxy);
+      await debugManager.launchBrowser(mockFingerprint, mockProxy);
       
       await debugManager.takeScreenshot(mockPage as any, 'test-screenshot');
       
@@ -549,7 +549,7 @@ describe('BrowserManager', () => {
     });
 
     it('should not take screenshot if debug mode is off', async () => {
-      const context = await browserManager.launchBrowser(mockFingerprint, mockProxy);
+      await browserManager.launchBrowser(mockFingerprint, mockProxy);
       
       await browserManager.takeScreenshot(mockPage as any, 'test-screenshot');
       
@@ -623,8 +623,9 @@ describe('BrowserManager', () => {
     it('should mask proxy URL in logs', async () => {
       await browserManager.launchBrowser(mockFingerprint, mockProxy);
       
-      const logCall = mockLogger.info.mock.calls.find(
-        call => call[0].includes('Launching browser')
+      const logCalls = (mockLogger.info as jest.Mock).mock.calls;
+      const logCall = logCalls.find(
+        (call: any) => call[0].includes('Launching browser')
       );
       
       expect(logCall).toBeDefined();
