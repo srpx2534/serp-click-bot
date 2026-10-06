@@ -8,6 +8,7 @@
  * - Lifecycle manager (crash recovery) test edilir
  * - Stealth scripts doğrulanır
  */
+import { BrowserContext } from 'patchright';
 
 import {
   BrowserManager,
@@ -42,12 +43,47 @@ const mockPage = {
 
 const mockContext = {
   newPage: jest.fn().mockResolvedValue(mockPage),
-  addCookies: jest.fn().mockResolvedValue(undefined),
-  cookies: jest.fn().mockResolvedValue([{ name: 'test', value: 'value' }]),
-  close: jest.fn().mockResolvedValue(undefined),
-  route: jest.fn().mockResolvedValue(undefined),
+  addCookies: jest.fn(),
+  cookies: jest.fn().mockResolvedValue([]),
+  close: jest.fn(),
+  route: jest.fn(),
   on: jest.fn(),
-};
+  // Eksik property'ler eklendi:
+  addInitScript: jest.fn(),
+  exposeBinding: jest.fn(),
+  removeAllListeners: jest.fn(),
+  once: jest.fn(),
+  addLocatorHandler: jest.fn(),
+  clearCookies: jest.fn(),
+  grantPermissions: jest.fn(),
+  clearPermissions: jest.fn(),
+  setGeolocation: jest.fn(),
+  setExtraHTTPHeaders: jest.fn(),
+  setOffline: jest.fn(),
+  waitForEvent: jest.fn(),
+  pages: jest.fn().mockReturnValue([]),
+  browser: jest.fn().mockReturnValue({}),
+  tracing: {
+    start: jest.fn(),
+    stop: jest.fn(),
+    stopChunk: jest.fn(),
+    startChunk: jest.fn(),
+  },
+  request: {},
+  clock: {
+    install: jest.fn(),
+    fastForward: jest.fn(),
+    pauseAt: jest.fn(),
+    resume: jest.fn(),
+    runFor: jest.fn(),
+    setFixedTime: jest.fn(),
+    setSystemTime: jest.fn(),
+  },
+  serviceWorkers: jest.fn().mockReturnValue([]),
+  backgroundPages: jest.fn().mockReturnValue([]),
+  _guid: 'mock-context',
+  _type: 'browserContext',
+} as unknown as BrowserContext;
 
 const mockBrowser = {
   newContext: jest.fn().mockResolvedValue(mockContext),
@@ -463,7 +499,7 @@ describe('BrowserManager (Patchright)', () => {
       await browserManager.launchBrowser(mockFingerprint, mockProxy);
       
       const dialogHandler = mockContext.on.mock.calls.find(
-        call => call[0] === 'dialog'
+        (call: [string, ...any[]]) => call[0] === 'dialog'
       )[1];
       
       const mockDialog = {
