@@ -6,7 +6,7 @@ import {
   FingerprintGenerator,
   getFingerprintGenerator,
   resetFingerprintGenerator,
-} from './FingerprintGenerator';
+} from '../../../src/core/fingerprint-generator';
 
 describe('FingerprintGenerator', () => {
   let dataDir: string;
