@@ -19,6 +19,9 @@
     "test:serp": "jest --testNamePattern=\"SERPScraper\" --verbose --forceExit",
     "test:serp:watch": "jest --testNamePattern=\"SERPScraper\" --watch",
     "test:serp:coverage": "jest --testNamePattern=\"SERPScraper\" --coverage",
+    "test:result": "jest --testNamePattern=\"ResultParser\" --verbose --forceExit",
+    "test:result:watch": "jest --testNamePattern=\"ResultParser\" --watch",
+    "test:result:coverage": "jest --testNamePattern=\"ResultParser\" --coverage",
     "test:unit": "jest --testPathPattern=\"test/unit\" --forceExit",
     "test:unit:coverage": "jest --testPathPattern=\"test/unit\" --coverage --forceExit",
     "test:watch": "jest --watch",
@@ -49,6 +52,7 @@
     "npm": ">=9.0.0"
   },
   "dependencies": {
+    "cheerio": "^1.2.0",
     "date-fns": "^3.6.0",
     "dotenv": "^16.4.5",
     "fs": "^0.0.1-security",
